@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+checkpoints/
+*.ckpt
+*.pth
+data/
+body_models/
+*.obj
+*.npy
+*.npz
