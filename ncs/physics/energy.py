@@ -22,24 +22,36 @@ def _deformation_gradient(verts: Tensor, rest_verts: Tensor, faces: Tensor):
     """
     Compute per-face 3x2 deformation gradient F mapping rest→deformed.
     Returns F: (F, 3, 2)
+
+    We build a 2×2 material-space matrix Dm_2d whose columns are the 2D
+    coordinates of the rest edges in a local orthonormal frame (e1, e2).
+    The deformation gradient is then F = Ds @ Dm_2d⁻¹, where Ds contains
+    the 3D deformed edge vectors as columns.  This gives F^T F = I at rest,
+    so the Green-Lagrange strain is exactly zero in the undeformed state.
     """
     u_def, v_def = _triangle_bases(verts, faces)       # (F, 3)
     u_rest, v_rest = _triangle_bases(rest_verts, faces)
 
-    # Dm: rest-space 2x2 matrix [u_rest_2d | v_rest_2d]
-    # We use 3D coordinates directly and compute F = [u_def|v_def] @ Dm^{-1}
-    # Dm in 2D: project rest edges onto local frame
-    # Build Ds (deformed) and Dm (rest) as (F,3,2)
-    Ds = torch.stack([u_def, v_def], dim=2)   # (F, 3, 2)
-    Dm = torch.stack([u_rest, v_rest], dim=2)  # (F, 3, 2)
+    # Local orthonormal frame from rest edges.
+    u_len = torch.norm(u_rest, dim=1, keepdim=True).clamp(min=1e-10)  # (F, 1)
+    e1 = u_rest / u_len  # (F, 3) — unit first edge direction
 
-    # Dm_inv: (F, 2, 2) pseudo-inverse via normal equations
-    DmT = Dm.transpose(1, 2)           # (F, 2, 3)
-    DmTDm = torch.bmm(DmT, Dm)        # (F, 2, 2)
-    DmTDm_inv = torch.linalg.inv(DmTDm)  # (F, 2, 2)
-    Dm_pinv = torch.bmm(DmTDm_inv, DmT)  # (F, 2, 3)
+    # 2D material coordinates of v_rest in the (e1, e2) frame.
+    v_proj = (v_rest * e1).sum(dim=1, keepdim=True)    # (F, 1)
+    v_perp = v_rest - v_proj * e1                      # (F, 3)
+    v_len  = torch.norm(v_perp, dim=1, keepdim=True).clamp(min=1e-10)  # (F, 1)
 
-    F = torch.bmm(Ds, Dm_pinv.transpose(1, 2))  # (F, 3, 2)
+    # Dm_2d: (F, 2, 2) — columns are 2D coords of rest edges
+    #   col 0 = (u_len, 0)^T,  col 1 = (v_proj, v_len)^T
+    zeros  = torch.zeros_like(u_len)                   # (F, 1)
+    col0   = torch.cat([u_len, zeros], dim=1)          # (F, 2)
+    col1   = torch.cat([v_proj,  v_len], dim=1)        # (F, 2)
+    Dm_2d  = torch.stack([col0, col1], dim=2)          # (F, 2, 2)
+
+    Dm_2d_inv = torch.linalg.inv(Dm_2d)                # (F, 2, 2)
+
+    Ds = torch.stack([u_def, v_def], dim=2)            # (F, 3, 2)
+    F  = torch.bmm(Ds, Dm_2d_inv)                     # (F, 3, 2)
     return F
 
 
