@@ -159,8 +159,11 @@ pytest
 
 ## Playground Engine (`playground/`, spec only so far)
 
-Real-time playground for evaluating neural cloth/body models: motion-matching character (LAFAN1),
-LBS + blendshapes, PBR rendering, ONNX Runtime / PyTorch / CUDA deformers.
+Real-time **C++ / Windows-only** playground for evaluating neural cloth/body models: the Geno
+character with motion matching on orangeduck's lafan1-resolved + 100style-retarget data
+(walk/run/sprint/crouch), CPU LBS + blendshapes, deferred PBR rendering, and ONNX Runtime /
+GLSL-compute / CUDA deformers. **No trained models are shipped. Neural parts are placeholder code.**
+The engine shares only files (`.npy`, `.onnx`) with the Python `ncs/` package.
 
 - Spec: `docs/playground/SPEC.md`
 - Open decisions: `docs/playground/DECISIONS.md`
