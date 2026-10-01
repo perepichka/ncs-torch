@@ -1,0 +1,15 @@
+# Normal-map validation for the NCS playground (raylib 6.0, OpenGL 4.3+ backend).
+#   1. python ../blender/make_normalmap_testcase.py <case_dir>        (bpy venv)
+#   2. cmake -S . -B build && cmake --build build --config Release
+#   3. build/Release/normalmap_validate.exe <case_dir> --out report   (Windows; hardware GPU)
+cmake_minimum_required(VERSION 3.25)
+project(pg_normalmap_validate CXX C)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+include(FetchContent)
+set(OPENGL_VERSION "4.3" CACHE STRING "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(raylib GIT_REPOSITORY https://github.com/raysan5/raylib.git GIT_TAG 6.0 GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(raylib)
+add_executable(normalmap_validate normalmap_validate.cpp)
+target_link_libraries(normalmap_validate PRIVATE raylib)

@@ -169,8 +169,9 @@ The engine shares only files (`.npy`, `.onnx`) with the Python `ncs/` package.
 
 - Spec: `docs/playground/SPEC.md`
 - Open decisions: `docs/playground/DECISIONS.md`
-- Existing tools: `playground/tools/gpu_validate` (raylib/GL/CUDA checks), `playground/tools/blender`
-  (skinning prototype), `playground/tools/analysis` (LAFAN1 transition/jump scan)
+- Existing tools: `playground/tools/gpu_validate` (raylib/GL/CUDA checks), `playground/tools/normalmap_validate`
+  (normal-map bake/render validation), `playground/tools/blender` (skinning prototype, normal-map test case),
+  `playground/tools/analysis` (LAFAN1 transition/jump scan)
 
 **Rule: ask questions instead of making assumptions.** Before you implement a playground phase,
 check its gate decisions in `DECISIONS.md`. If any are still open, ask the user. Don't silently

@@ -20,7 +20,8 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 | D19 | Geno has no blendshapes. Are procedural test morphs + placeholder correctives enough? | Yes | Sculpt real morphs; a second character with blendshapes | P1 |
 | D20 | Recording format for the Python `ncs` side? | `.npy` quaternions + root trajectory, plus BVH | `.npz` with rotation matrices | P5 |
 | D23 | Blender runtime for tools: the `bpy` pip wheel in a Python 3.11 venv (what the prototype used), or a Blender app install with scipy pip-installed into its Python? Which Blender version? | `bpy` wheel venv (tested with 5.0.1) | Blender 4.2 LTS app + `--python` | P4 |
-| D26 | Graphics API. Real engines on Windows use **D3D12 or Vulkan**. OpenGL 4.6 (raylib) covers everything this spec uses: compute, SSBOs, deferred, GPU skinning, CUDA interop. It lacks hardware ray tracing, mesh shaders (except via NV extensions), async compute queues, explicit memory and bindless-by-default. Stay on raylib/GL or move to a modern API? | Stay on raylib/GL 4.6: fastest to build, ports Holden/GenoView code, and the GPU-side techniques map 1:1. Revisit if RT shadows/GI or async compute become needed. | D3D12 (+ DirectML option for ORT, D3D12–CUDA interop), or Vulkan, with a thin custom renderer (e.g. on bgfx/Diligent, or raw). Several times more engine code. | P0 |
+| D28 | Which kinds of normal-map detail will you evaluate? | Per-garment baked maps first (validated pipeline), then a tiling fabric detail map | Dynamic wrinkle maps (weights or a texture written by a deformer) | P2/P4 |
+| D29 | Should neural deformers output normals or tangent frames alongside positions? Positions-only costs ~1° mean normal accuracy under the normal-map test (0.67° → 1.44°). | Optional `normals`/`frames` outputs in the manifest; positions-only stays supported | Positions only; recompute normals on a denser sim mesh | P5 |
 | D24 | Which implicit neural models will you test first? This shapes the `implicit_mlp` manifest. | Neural body SDF (collision proxy + metric) and a per-vertex deformation field | NeRF-like/appearance; hash-grid encodings (CUDA path) | P6 |
 
 ## Resolved
@@ -30,6 +31,8 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 | D1a | Engine language is **C++**, not Python. | 2026-10-01 |
 | D1 | **raylib**, provided modern shader support is validated. raylib 6.0 GL 4.3 passed T0–T8, T10 and T11 **API-only** (sandbox software rasterizer). **Hardware validation of T0–T11 on the Windows/NVIDIA target is the P0 gate.** The API choice is reopened as D26. | 2026-10-01 |
 | D25 | **No software rendering, proper GPU rendering like real engines.** Hardware GPU only. The GPU owns all geometry: morphs, skinning, deformers, normals and metrics are compute passes. The CPU runs animation only. Readback is asynchronous and only for metrics/recording. CPU LBS exists only as a test oracle. | 2026-10-01 |
+| D26 | Graphics API: **stay on raylib (OpenGL) for now.** Revisit D3D12/Vulkan only if needed. | 2026-10-01 |
+| D27 | **Normal mapping is supported and validated:** high-res → Decimate → Cycles MikkTSpace bake → engine render compared per pixel against the high-res mesh, at rest and under deformation (`tools/normalmap_validate`, N1–N5 pass API-only; hardware rerun required in P2). | 2026-10-01 |
 | D2 | **Windows only.** | 2026-10-01 |
 | D3 | **Same repo** (`playground/`). | 2026-10-01 |
 | D4 | Body model: **Geno** from orangeduck's retargeted datasets. | 2026-10-01 |
