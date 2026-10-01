@@ -19,3 +19,4 @@ body_models/
 playground/build/
 playground/data/
 playground/runs/
+!docs/playground/data/
