@@ -159,14 +159,17 @@ pytest
 
 ## Playground Engine (`playground/`, spec only so far)
 
-Real-time **C++ / Windows-only** playground for evaluating neural cloth/body models: the Geno
-character with motion matching on orangeduck's lafan1-resolved + 100style-retarget data
-(walk/run/sprint/crouch), CPU LBS + blendshapes, deferred PBR rendering, and ONNX Runtime /
-GLSL-compute / CUDA deformers. **No trained models are shipped. Neural parts are placeholder code.**
+Real-time **C++ / Windows-only** playground (raylib 6.0, GL 4.3) for evaluating neural cloth/body
+models: the Geno character with motion matching on orangeduck's lafan1-resolved + 100style-retarget
+data (walk/run/sprint/crouch/jump, 60 Hz), CPU LBS + blendshapes, deferred PBR rendering, and
+ONNX Runtime / GLSL-compute / implicit-MLP / CUDA deformers. Garments are auto-skinned offline in
+Blender (Robust Skin Weights Transfer). **No trained models are shipped. Neural parts are placeholder code.**
 The engine shares only files (`.npy`, `.onnx`) with the Python `ncs/` package.
 
 - Spec: `docs/playground/SPEC.md`
 - Open decisions: `docs/playground/DECISIONS.md`
+- Existing tools: `playground/tools/gpu_validate` (raylib/GL/CUDA checks), `playground/tools/blender`
+  (skinning prototype), `playground/tools/analysis` (LAFAN1 transition/jump scan)
 
 **Rule: ask questions instead of making assumptions.** Before you implement a playground phase,
 check its gate decisions in `DECISIONS.md`. If any are still open, ask the user. Don't silently

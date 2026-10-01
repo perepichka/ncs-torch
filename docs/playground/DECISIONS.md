@@ -9,31 +9,34 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 
 | ID | Question | Recommended default | Alternatives | Blocks |
 |---|---|---|---|---|
-| D1 | Which graphics/window framework in C++? | **raylib 5.x (GL 4.3)** + rlImGui, reusing MIT code from Holden's Motion-Matching and GenoView | bgfx; sokol; a custom D3D11/D3D12 or Vulkan layer (more control, much more code) | P0 |
-| D3 | Where does the engine live? | `playground/` in this repo, sharing data with `ncs/` through files only | Separate repo | P0 |
-| D6 | Motion DB contents? | lafan1-resolved `walk*/run*/sprint*/ground*` (crawl excluded) + 100STYLE `Neutral` and `Crouched`, all mirrored | Fewer clips for faster iteration; more 100STYLE styles | P3 |
-| D7 | Sim tick rate? At what fps are the target models trained? | 60 Hz, matching the data | 30 Hz (models run at a lower `rate_hz` and the engine resamples) | P1 |
-| D8 | Which garments come first? | Procedural skirt + cape, then a GarmentCode T-shirt + pants made for Geno | NCS sample T-shirt/pants refit to Geno; others you have | P4 |
+| D6 | Final motion DB clip list? | lafan1-resolved walk/run/sprint + scan-selected crouch/transition/jump ranges + 100STYLE `Neutral`/`Crouched`, all mirrored; `ground*` excluded (mostly crawl) | Fewer clips for faster iteration; more 100STYLE styles | P3 |
 | D9 | Model output convention: does `ncs` predict unposed verts (engine applies LBS) or world space? | `unposed` + garment LBS, as in the original NCS | `world`, offsets | P5 |
-| D10 | GPU deformer paths and ORT execution providers? | ORT CUDA EP + CPU EP; both GLSL-compute and CUDA templates | DirectML or TensorRT EP; CUDA only; GLSL only | P5/P6 |
-| D11 | Asset handling? | `tools/fetch_assets.ps1` into git-ignored `data/`; generated garment OBJs not committed | Commit small CC0 assets; Git LFS | P2 |
-| D13 | Which metrics matter most? Do you have any already? | Penetration, stretch, jitter, timings | Physics energy in C++ (port of `ncs.physics`); comparison against a ground-truth sim | P5 |
-| D14 | Is the rendering bar enough (deferred PBR, IBL, shadows, SSAO, sheen cloth, AgX, FXAA)? | Yes for v1 | TAA, skin SSS, contact shadows, hair | P2 |
-| D15 | Is the controls mapping OK (§6.3)? Do you want jump/vault in v1? | Mapping as specced; no jump in v1 | Jump using lafan1-resolved `jumps*` (needs an action-tag system) | P3 |
-| D16 | Stand↔crouch transitions: is inertialization alone enough, or should transition ranges be hand-tagged from LAFAN1 `ground*`? | Tag any natural transitions found; otherwise inertialization with a 0.2 s halflife | Author or record dedicated transition clips | P3 |
-| D18 | Build details: is C++20 / MSVC 2022 / CMake + vcpkg OK? Which CUDA toolkit version? | Yes; CUDA 12.x optional behind `PG_WITH_CUDA` | Visual Studio solution; Conan | P0 |
-| D19 | Geno has no blendshapes. Are procedural test morphs + placeholder correctives enough for now? | Yes | Sculpt real morphs for Geno; a second character that has blendshapes | P1 |
-| D20 | Recording format for feeding the Python `ncs` side? | `.npy` quaternions + root trajectory, plus BVH | `.npz` with rotation matrices; a custom format | P5 |
+| D10 | ORT execution providers? | CUDA EP + CPU EP | Also TensorRT or DirectML | P5 |
+| D11 | Asset handling? | `tools/fetch_assets.ps1` into git-ignored `data/`; generated garments not committed | Commit small CC0 assets; Git LFS | P2 |
+| D13 | Which metrics matter most? | Penetration, stretch, jitter, timings, split by motion state | Port `ncs.physics` energies to C++; ground-truth sim comparison | P5 |
+| D14 | Is the rendering bar enough (deferred PBR, IBL, shadows, SSAO, sheen cloth, AgX, FXAA)? | Yes for v1 | TAA, skin SSS, contact shadows | P2 |
+| D15b | Jump scope? | Standing + running jumps on flat ground; no jump from crouch unless data exists; no vaults | Crouch-jump; double-jump/parkour (out of scope) | P3 |
+| D18 | Is C++20 / MSVC 2022 / CMake + vcpkg OK? Which CUDA toolkit version? | Yes; CUDA 12.x behind `PG_WITH_CUDA` | Visual Studio solution; Conan | P0 |
+| D19 | Geno has no blendshapes. Are procedural test morphs + placeholder correctives enough? | Yes | Sculpt real morphs; a second character with blendshapes | P1 |
+| D20 | Recording format for the Python `ncs` side? | `.npy` quaternions + root trajectory, plus BVH | `.npz` with rotation matrices | P5 |
+| D23 | Blender runtime for tools: the `bpy` pip wheel in a Python 3.11 venv (what the prototype used), or a Blender app install with scipy pip-installed into its Python? Which Blender version? | `bpy` wheel venv (tested with 5.0.1) | Blender 4.2 LTS app + `--python` | P4 |
+| D24 | Which implicit neural models will you test first? This shapes the `implicit_mlp` manifest. | Neural body SDF (collision proxy + metric) and a per-vertex deformation field | NeRF-like/appearance; hash-grid encodings (CUDA path) | P6 |
 
 ## Resolved
 
 | ID | Decision | Date |
 |---|---|---|
 | D1a | Engine language is **C++**, not Python. | 2026-10-01 |
+| D1 | **raylib**, provided modern shader support is validated. raylib 6.0 GL 4.3 passed T0–T8 (compute, SSBO, MRT float, image store, GPU implicit MLP + sphere tracing). T9 (CUDA–GL interop) must pass on the Windows target in P0. | 2026-10-01 |
 | D2 | **Windows only.** | 2026-10-01 |
-| D4 | Body model: **Geno** from orangeduck's retargeted datasets (lafan1-resolved, zeroeggs-retarget, 100style-retarget). | 2026-10-01 |
-| D5 | Retargeting: **not needed.** All datasets already share Geno's skeleton. | 2026-10-01 |
-| D12 | Usage scope: **research project.** Non-commercial dataset and asset terms are acceptable. | 2026-10-01 |
-| D17 | Motion matching based on LAFAN1, using **lafan1-resolved** (60 fps, Geno skeleton), with basic controls: movement, crouching, sprinting. | 2026-10-01 |
+| D3 | **Same repo** (`playground/`). | 2026-10-01 |
+| D4 | Body model: **Geno** from orangeduck's retargeted datasets. | 2026-10-01 |
+| D5 | Retargeting: **not needed** (shared Geno skeleton). | 2026-10-01 |
+| D7 | **60 Hz** sim tick. | 2026-10-01 |
+| D8 | Initial garments: **procedural skirt + cape, then GarmentCode T-shirt + pants**, with auto-generated skinning weights (Blender). | 2026-10-01 |
+| D12 | **Research project**; non-commercial dataset and asset terms are acceptable. | 2026-10-01 |
+| D15 | **Jumping is supported** in v1. | 2026-10-01 |
+| D16 | Stand↔crouch: **use transitions found in the data** (scan: 112 candidates); **fall back to inertialization blending** (0.2 s). | 2026-10-01 |
+| D17 | Motion matching based on LAFAN1, using **lafan1-resolved**, with controls for movement, crouch, sprint and jump. | 2026-10-01 |
 | D21 | **No models are produced or shipped.** Neural components are placeholder code only. | 2026-10-01 |
-| D22 | Garments: start from **free online sources** (GarmentCode MIT, NeuralClothSim samples) plus procedural ones. | 2026-10-01 |
+| D22 | Garments come from **free online sources** (GarmentCode MIT, NeuralClothSim samples) plus procedural ones. | 2026-10-01 |

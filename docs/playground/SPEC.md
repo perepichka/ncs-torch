@@ -5,7 +5,7 @@ body models** on the **Geno** character, driven by **motion matching** on
 orangeduck's retargeted datasets (LAFAN1-resolved + 100STYLE-retarget). It is a
 playground built for fast iteration. It is not a game engine.
 
-> **Status:** draft spec, revision 2. Decisions marked **[D#]** are tracked in
+> **Status:** draft spec, revision 3. Decisions marked **[D#]** are tracked in
 > [`DECISIONS.md`](DECISIONS.md). Defaults here are recommendations until the
 > user confirms them. Before implementing a phase, resolve its open decisions
 > with the user. **Ask. Don't assume.**
@@ -20,50 +20,83 @@ playground built for fast iteration. It is not a game engine.
 
 ### Goals
 1. Drive Geno interactively (gamepad or keyboard) with **motion matching**:
-   idle, walk, run, **sprint**, **crouch** (idle/walk/run), and strafe.
+   idle, walk, run, **sprint**, **crouch** (idle/walk/run), strafe and **jump**.
 2. **LBS + blendshapes** on the CPU, so it is simple and testable. Upload the
    result to the GPU each tick.
 3. Render with modern shading that looks good enough to judge cloth: deferred
    PBR, IBL, shadows, SSAO, a sheen cloth BRDF, HDR + AgX tonemap, and a
    GenoView-style "artifact grid" view.
-4. Plug-in deformers through **ONNX Runtime**, **custom GLSL compute** or
-   **custom CUDA**. All of them are placeholders at first.
-5. Start from **free garments**, fit them to Geno, and use **LBS as the
-   baseline** that every model is compared against.
+4. Plug-in deformers through **ONNX Runtime**, **GLSL compute** or **CUDA**,
+   including **implicit neural models evaluated on the GPU** (§8.4). All of
+   them are placeholders at first.
+5. Start from **free garments**, auto-skin them to Geno in **Blender**, and use
+   **LBS as the baseline** that every model is compared against.
 6. Live metrics, deterministic record/replay, A/B comparison and hot reload of
    shaders, configs and models.
 
 ### Non-goals (v1)
 - Editor, scene graph, prefabs, asset streaming, scripting language
-- Physics engine, environment collision, terrain or stairs (flat ground only)
+- Physics engine, environment collision, terrain, stairs, vaults/parkour (flat ground only)
 - Animation state machines or blend trees (motion matching plus tags replaces them)
-- Learned Motion Matching, jumps and vaults (later, see **[D15]**)
-- Producing or shipping any trained model. Model export lives in the Python `ncs/` side, if anywhere.
+- Learned Motion Matching
+- Producing or shipping any trained model
 - Linux, macOS, consoles, web. **Windows only.**
 
 ---
 
-## 2. Stack **[D1, D18]**
+## 2. Stack
 
 | Concern | Choice | Why |
 |---|---|---|
-| Language / toolchain | **C++20, MSVC 2022, CMake ≥ 3.25, vcpkg manifest** | Standard on Windows |
-| Window, GL, input, gamepad | **raylib 5.x** (OpenGL 4.3 backend) | Holden's MIT Motion-Matching demo and MIT GenoView (deferred + shadows + SSAO) are both raylib, so their code ports almost verbatim. GL 4.3 has compute shaders and SSBOs. Gamepads come through GLFW/XInput. |
+| Language / toolchain | **C++20, MSVC 2022, CMake ≥ 3.25, vcpkg manifest** **[D18]** | Standard on Windows |
+| Window, GL, input, gamepad | **raylib 6.0, OpenGL 4.3 backend** (`-DOPENGL_VERSION=4.3`); **validated in §2.1** | Holden's MIT Motion-Matching demo and MIT GenoView (deferred + shadows + SSAO) are both raylib, so their code ports almost verbatim |
+| Raw GL beyond rlgl | a **glad 4.6** loader initialized with `rlGetProcAddress` | Timer queries, `glGetTexImage`, DSA, etc. rlgl doesn't wrap everything. |
 | UI | Dear ImGui + **rlImGui** + **ImPlot** | Panels and live metric plots |
-| Character / mesh import | **ufbx** (single-file, MIT) for `Geno.fbx`; tinyobjloader for garment OBJ | ufbx reads the skin, bind pose and blendshapes directly, with no Maya step |
+| Character / mesh import | **ufbx** (single-file, MIT) for `Geno.fbx` and skinned garment FBX | Reads skin, bind pose and blendshapes directly |
 | Images / HDR | stb_image, stb_image_write | |
 | Config | **TOML** via toml++ (header-only) | Readable, hot-reloadable |
-| Nearest-neighbor | nanoflann | Garment binding and penetration metric |
-| NN inference | **ONNX Runtime** (official GPU package: CUDA EP, CPU EP fallback) | **[D10]** |
-| CUDA (optional) | CUDA Toolkit 12.x, CMake option `PG_WITH_CUDA` | Custom deformer kernels, GL interop |
+| Nearest-neighbor | nanoflann | Penetration metric |
+| NN inference | **ONNX Runtime** (official GPU package: CUDA EP, CPU EP fallback) **[D10]** | |
+| CUDA (optional) | CUDA Toolkit 12.x, CMake option `PG_WITH_CUDA` | Custom kernels, CUDA–GL interop |
+| Offline asset tools | **Blender** via the `bpy` wheel (+ scipy) in a Python 3.11 venv | Garment skinning (§9). The engine itself never runs Python. |
 | Tests | doctest + CTest | |
 
 **One rule keeps this simple:** *the CPU owns the canonical state.* Skeleton,
 skinning, blendshapes and garment vertices live in CPU arrays and upload to GL
 buffers once per tick. Body + garments total around 30k vertices, which is under
-1 MB per tick. GPU deformers (ONNX CUDA EP, GLSL compute, CUDA) are
-accelerators that write back into those buffers. Zero-copy CUDA–GL interop is
-a later optimization (P6).
+1 MB per tick. GPU deformers write into GL buffers that the renderer draws
+directly. T5 and T9 in §2.1 cover that path, and the result can be read back
+when metrics need it.
+
+### 2.1 raylib validation (done, `playground/tools/gpu_validate/`)
+A standalone CMake project pulls raylib **6.0** and checks every GPU feature
+this spec relies on. It ran on Mesa llvmpipe (GL 4.5 core, a software
+renderer) in the dev sandbox:
+
+| Test | Result |
+|---|---|
+| T0 Raw GL entry points through `rlGetProcAddress` | PASS |
+| T1 GL 4.3+ core context with compute; limits printed | PASS |
+| T2 A broken shader returns id 0 without crashing (hot-reload fallback) | PASS |
+| T3 **Implicit MLP (3-64-64-64-1, sine) in a compute shader**, weights in an SSBO: GPU vs CPU max error 4.1e-8 over 110k points; GL timer query works | PASS |
+| T4 **Sphere-traced neural implicit** in a fragment shader reading the SSBO; image saved | PASS |
+| T5 Compute shader writes vertices into an SSBO that is drawn directly as a vertex buffer (zero-copy GPU deformer) | PASS |
+| T6 Float MRT G-buffer (3× RGBA16F + RGBA32F + depth), HDR and negative values preserved | PASS (after disabling blend, see below) |
+| T7 Compute `imageStore` into an rgba32f texture | PASS |
+| T8 `#version 450` shaders compile in the requested 4.3 context | PASS (driver-dependent) |
+| T9 **CUDA–GL interop**: CUDA writes the GL buffer from T5 | compiles and links; **must run on the Windows/NVIDIA target** (no GPU in the sandbox) |
+
+Rules that came out of the validation:
+- raylib **enables alpha blending by default**. The G-buffer and any
+  float/compute output pass must call `rlDisableColorBlend()`, otherwise values
+  get multiplied by alpha.
+- **Never include `<windows.h>`** (or CUDA/GL system headers) in a translation
+  unit that includes `raylib.h`, because the Win32 symbols clash (`CloseWindow`,
+  `Rectangle`, …). Isolate Win32, CUDA and ORT code in their own `.cpp` files.
+- raylib asks for a 4.3 context. NVIDIA drivers normally return 4.6 core, so
+  `#version 450/460` should work there. P0 confirms this on the target with the validator.
+- **P0 gate:** run `gpu_validate.exe` (configured with `-DPG_WITH_CUDA=ON`) on
+  the Windows machine. T0–T9 must all pass.
 
 ---
 
@@ -76,39 +109,39 @@ it is *"free for non-commercial research use"*.
 
 | Property | Value (measured from the repo files) |
 |---|---|
-| Mesh | 10,329 verts after UV/normal split, 18,660 tris, one material, has UVs |
-| Skin | 75 bones, ≤ 4 influences per vertex |
-| Skeleton | `Hips → Spine → Spine1 → Spine2 → Spine3 → Neck → Neck1 → Head`, full fingers (`*Hand{Thumb,Index,Middle,Ring,Pinky}{1-4}`), `*Shoulder/Arm/ForeArm/Hand`, `*UpLeg/Leg/Foot/ToeBase`, plus `*End` leaf joints |
-| Bind pose | `Geno_bind.bvh`: **A-pose** (arms about 45° down) |
+| Mesh | 9,332 unique verts (10,329 after UV/normal split), 18,660 tris, one material, has UVs |
+| Skin | 75 bones (54 carry weights), ≤ 4 influences per vertex |
+| Skeleton | `Hips → Spine → Spine1 → Spine2 → Spine3 → Neck → Neck1 → Head`, full fingers, `*Shoulder/Arm/ForeArm/Hand`, `*UpLeg/Leg/Foot/ToeBase`, `*End` leaf joints |
+| Bind pose | `Geno_bind.bvh`: **A-pose** (arms about 45° down; hands hang at hip height) |
 | Stance pose | `Geno_stance.bvh`: **T-pose** |
-| Size | about 1.66 m tall, hips at 0.855 m |
+| Size | about 1.70 m tall, hips at 0.855 m |
 | Blendshapes | **none** (see §7) |
 
-The same skeleton is used by every dataset below, so **no retargeting is
-needed**.
+Every dataset below uses the same skeleton, so **no retargeting is needed**.
 
 ### 3.2 Motion data **[D6]**
 
 | Dataset | Content used | fps | License |
 |---|---|---|---|
-| **lafan1-resolved** (orangeduck) | `walk*`, `run*`, `sprint*`, `ground*` (crouch/crawl), with crawl ranges excluded | 60 | LAFAN1 terms: CC BY-NC-ND 4.0, non-commercial |
-| **100style-retarget** (orangeduck) | styles **`Neutral`** and **`Crouched`**, clip types `FW BW SW FR BR SR ID TR1` (forward/back/side × walk/run, idle, transitions) | 60 | CC BY 4.0 |
-| zeroeggs-retarget | not used in v1 (speech gestures); possible idle variety later | 60 | ZeroEGGS terms |
+| **lafan1-resolved** | `walk*`, `run*`, `sprint*`; **crouch + stand↔crouch transitions** from `aiming2_subject3`, `obstacles4/5/6_*`, `multipleActions1_subject4`; **jumps** from `jumps1_*` and selected flat-ground `obstacles*` events | 60 | LAFAN1 terms: CC BY-NC-ND 4.0 |
+| **100style-retarget** | styles **`Neutral`** and **`Crouched`**, clip types `FW BW SW FR BR SR ID TR1` | 60 | CC BY 4.0 |
+| zeroeggs-retarget | not used in v1 | 60 | ZeroEGGS terms |
 
-100STYLE `Crouched` gives crouch walk, run, sidestep, backwards and idle, which
-LAFAN1 lacks. LAFAN1 `ground*` adds crouch variety and possibly stand↔crouch
-transitions **[D16]**.
+**Scan results (§6.2):** LAFAN1 `ground*` turned out to be mostly **crawling**,
+so it is excluded. Crouch locomotion is spread across the `obstacles`,
+`aiming` and `multipleActions` clips. 100STYLE `Crouched` is the main source of
+clean crouch walking and running.
 
-Downloads are BVH zips from `theorangeduck.com/media/uploads/Geno/<dataset>/bvh.zip`.
-`tools/fetch_assets.ps1` downloads them into the git-ignored `data/`. Never
-commit raw or derived motion data. *(This sandbox got HTTP 403 from that host.
-On a normal Windows machine it should work. If it doesn't, the script prints
-manual-download instructions.)*
+Downloads are `theorangeduck.com/media/uploads/Geno/<dataset>/bvh.zip`, via
+`tools/fetch_assets.ps1` into the git-ignored `data/`. Never commit raw or
+derived motion data. *(That host returned 403 to the dev sandbox. On a normal
+machine it should work. If it doesn't, the script prints manual-download
+instructions.)*
 
 ### 3.3 Conventions
 - World is **Y-up, right-handed, meters**. Geno faces **+Z**, with its left at +X. BVH is in cm, so convert on load.
-- Quaternions are stored `(w,x,y,z)`. The math lib is Holden's `vec.h`/`quat.h`/`spring.h` style (MIT).
-- **Fixed 60 Hz simulation tick**, matching the data **[D7]**. Rendering runs
+- Quaternions are stored `(w,x,y,z)`. The math lib follows Holden's `vec.h`/`quat.h`/`spring.h` (MIT).
+- **Fixed 60 Hz simulation tick** (decided), matching the data. Rendering runs
   at vsync. Optional render interpolation is off by default.
 - Joint order is the BVH order (75 joints). Models can take a subset (§8.3).
 
@@ -116,31 +149,37 @@ manual-download instructions.)*
 
 ## 4. Architecture
 
+Lives in **`playground/` in this repo** (decided).
+
 ```
 playground/
 ├── CMakeLists.txt  vcpkg.json  CMakePresets.json
 ├── src/
-│   ├── app/        main.cpp, App (main loop, CLI), Clock, Config (toml++), HotReload
+│   ├── app/        main.cpp, App (main loop, CLI), Clock, Config (toml++), HotReload, gl_loader (glad via rlGetProcAddress)
 │   ├── math/       vec, quat, mat, spring (Holden-style), transforms
 │   ├── anim/       Skeleton, Pose, BVH loader, FK, mirror, ClipPlayer, FootIK
-│   ├── mm/         Database, Tags, Features, Search (AABB), Controller, Inertializer, Recorder/Replay
+│   ├── mm/         Database, Tags, Features, Search (AABB), Controller, Jump, Inertializer, Recorder/Replay
 │   ├── body/       BodyModel (ufbx loader), Morphs, LBS (CPU), Normals
-│   ├── garment/    Garment asset, procedural garments, Fitter, SkinBinding
-│   ├── deform/     IDeformer, registry, Lbs/Static, Placeholder, Onnx, GlslCompute, Cuda (.cu)
+│   ├── garment/    Garment asset (skinned FBX via ufbx), sim/render mesh maps
+│   ├── deform/     IDeformer, registry, Lbs/Static, Placeholder, Onnx, GlslCompute, ImplicitMlp, Cuda (.cu, own TU)
 │   ├── render/     Renderer (deferred), GBuffer, Shadow, SSAO, IBL, Post, Materials, DebugDraw
 │   ├── eval/       Metrics, CSV/NPY writers, Capture
 │   └── ui/         ImGui panels
-├── shaders/        GLSL: gbuffer, lighting, ssao, shadow, post, materials/, user/
+├── shaders/        GLSL: gbuffer, lighting, ssao, shadow, post, materials/, user/, implicit/
 ├── scenes/         default.toml, turntable.toml, eval_track.toml, clip_browser.toml
-├── assets/         small redistributable assets (procedural garment params, materials)
-├── models/         *.model.toml manifests ONLY (placeholder.model.toml); no weights committed
+├── assets/         small redistributable assets (materials, procedural garment params)
+├── models/         *.model.toml manifests ONLY (placeholders); no weights committed
 ├── tests/          doctest unit tests
-└── tools/          fetch_assets.ps1
+└── tools/
+    ├── gpu_validate/   raylib/GL/CUDA capability validator (exists)
+    ├── blender/        garment generation + skinning (prototype exists)
+    ├── analysis/       LAFAN1 transition/jump scan (exists)
+    └── fetch_assets.ps1
 ```
 
-Location is `playground/` in this repo by default **[D3]**. The C++ engine has
-no build or runtime dependency on the Python `ncs/` package. They exchange
-files: recorded poses and meshes go out as `.npy`, models come in as `.onnx`.
+The C++ engine has no build or runtime dependency on the Python `ncs/`
+package. They exchange files: recorded poses and meshes go out as `.npy`,
+models come in as `.onnx` or weight files.
 
 ### Main loop
 ```cpp
@@ -148,9 +187,9 @@ while (!WindowShouldClose()) {
     input.Poll();
     acc += clock.FrameDt() * timeScale;
     while (acc >= kTickDt) {                             // fixed 60 Hz
-        controller.Update(input, camera, kTickDt);       // desired vel/facing/stance, springs
+        controller.Update(input, camera, kTickDt);       // desired vel/facing/stance/jump, springs
         animSource->Step(kTickDt, pose);                 // MotionMatching | ClipPlayer | Replay
-        footIk.Apply(pose);                              // optional
+        footIk.Apply(pose);                              // optional, disabled while airborne
         body.Update(pose, morphWeights);                 // morphs + LBS + normals (CPU)
         for (auto& g : garments) g.deformer->Step(ctx, g.out);
         metrics.Update(ctx); recorder.Update(ctx);
@@ -168,35 +207,31 @@ while (!WindowShouldClose()) {
 ## 5. Animation core (`anim/`)
 
 - **BVH loader** handles any channel order (Geno BVHs use 6 channels on every
-  joint, `Zrotation Yrotation Xrotation`), converts cm to m and outputs local
-  `rot (J,4)` and `pos (J,3)` per frame.
+  joint, ZYX), converts cm to m and outputs local `rot (J,4)` and `pos (J,3)`.
 - **FK and mirroring:** mirroring swaps the `Left*` and `Right*` names and
-  reflects X, following the `animation_mirror` method from Holden's
-  `generate_database.py`.
+  reflects X, as in Holden's `animation_mirror`.
 - **ClipPlayer:** play, scrub and loop any BVH. Its *clip browser* scene doubles
   as a GenoView-equivalent viewer and as the tagging UI (§6.2).
-- **Foot IK:** a port of Holden's contact locking + two-bone IK
-  (`ik_foot_height 0.02`, `ik_toe_length 0.15`, `ik_unlock_radius 0.2`,
-  `ik_blending_halflife 0.1`). Off by default.
+- **Foot IK:** a port of Holden's contact locking + two-bone IK. Off by default
+  and disabled during jump flight.
 
 ---
 
 ## 6. Motion matching (`mm/`)
 
 Start by porting the **MIT reference `orangeduck/Motion-Matching`**
-(`controller.cpp`, `database.h`, `character.h`, `spring.h`) to the Geno
-skeleton. Then add what it lacks: **tags** (stand/crouch), **sprint** and
-**crouch**.
+(`controller.cpp`, `database.h`, `character.h`, `spring.h`) to Geno. Then add
+what it lacks: **tags**, **sprint**, **crouch** and **jump**.
 
 ### 6.1 Database build (`playground.exe --build-db scenes/mm_db.toml`, C++)
-1. Load the configured clip list, with frame ranges, from both datasets.
+1. Load the clip list, with frame ranges, from both datasets.
 2. Optionally **mirror** every clip, which doubles the data.
 3. **Simulation bone:** position = `Spine2` projected to the ground and
-   Savitzky-Golay smoothed. Facing = `Hips` forward on XZ, smoothed. This is
-   Holden's method. Check `Spine2` vs `Spine3` on Geno.
-4. Compute local/global positions and rotations, velocities and angular velocities.
+   Savitzky-Golay smoothed. Facing = `Hips` forward on XZ, smoothed.
+   During jump ranges the sim bone stays on the ground plane.
+4. Compute local/global positions, rotations, velocities and angular velocities.
 5. Label **contacts** on `LeftToeBase` and `RightToeBase` with height + velocity thresholds.
-6. Compute **features** (all in the sim-bone frame, 27 dims, Holden's set):
+6. Compute **features** (sim-bone frame, 27 dims, Holden's set):
 
    | Group | Dims | Default weight |
    |---|---|---|
@@ -206,26 +241,56 @@ skeleton. Then add what it lacks: **tags** (stand/crouch), **sprint** and
    | Trajectory positions (XZ) at +20/+40/+60 ticks | 6 | 1.0 |
    | Trajectory directions (XZ) at +20/+40/+60 ticks | 6 | 1.5 |
 
-7. Normalize per group, build the **AABB acceleration structure** (Holden's
-   small/large bounding boxes) per tag, and mark frames whose trajectory window
-   crosses a range end as invalid.
-8. Write `data/mm/db.bin` (bones, contacts, ranges, tags) and `data/mm/features.bin`.
-   Print **speed statistics per tag** (p50/p95 forward, side and back) so the
-   controller speeds can be tuned against the real data.
+7. Normalize per group, build **AABB acceleration** (Holden's small/large
+   boxes) **per tag set**, and mark frames whose trajectory window crosses a
+   range end as invalid.
+8. Write `data/mm/db.bin` + `data/mm/features.bin`. Print speed statistics
+   (p50/p95 forward, side and back) per tag, and jump statistics (air time,
+   takeoff speed), so the controller can be tuned against the real data.
 
-### 6.2 Tags (`data/mm/tags.toml`)
-- Tags per frame range: `stand`, `crouch`, `transition`, `exclude` (crawl, falls, bad frames).
-- The build tool **suggests** tags automatically: crouch when hip height is
-  below a threshold (default 0.65 m, tunable), and `exclude` when the head is
-  below the hips. A person confirms the suggestions in the clip browser
-  (timeline with colored tag ranges, set or clear on a selection, save).
-- 100STYLE clips get their tags from the style name (`Neutral` → stand, `Crouched` → crouch).
+### 6.2 Tags and the LAFAN1 scan
+Tags apply per frame range (`data/mm/tags.toml`):
+- **Stance:** `stand`, `crouch`
+- **Transitions:** `transition` (stand↔crouch), valid in both stance searches
+- **Jumps:** `jump` with events `takeoff` and `land`
+- `exclude`: crawl, falls, fights, bad frames
+
+Tags are **suggested automatically** and **confirmed by a person** in the clip
+browser (a timeline with colored ranges, set or clear on a selection, save).
+100STYLE gets tags from its style names.
+
+**Scan of LAFAN1 (done, `tools/analysis/scan_lafan1.py`):** the scan ran on the
+original 30 fps release, which uses the same captures that lafan1-resolved
+re-solves. Times are in seconds. Results are in
+[`data/lafan1_crouch_transitions.csv`](data/lafan1_crouch_transitions.csv) and
+[`data/lafan1_jump_candidates.csv`](data/lafan1_jump_candidates.csv).
+- **Heuristics:**
+  - Crouch: hips < 0.78 × the subject's standing hip height, with the head still above 0.55 × standing head height.
+  - Stand: hips > 0.88 × standing.
+  - Transition: stable stand ↔ stable crouch within 1.5 s with no crawl in between.
+  - Flight: all four foot joints above ground + 8 cm, with the feet moving, for 0.15–1.0 s.
+- **Stand↔crouch transitions:** 398 raw candidates. **112 are
+  locomotion-friendly** (from aiming, obstacles, multipleActions or ground clips,
+  lasting 0.2–1.2 s): 47 stand→crouch and 65 crouch→stand, **71 of them while
+  moving**. Top sources: `aiming2_subject3` (17), `obstacles6_subject1` (13),
+  `obstacles5_subject4` (11), `multipleActions1_subject4` (10),
+  `obstacles4_subject4` (10). Fight and dance clips produce many false positives
+  (stances, lunges) and are excluded.
+- **Jumps:** `jumps1_*` has 125 flight events (51 with ≥ 0.3 s air time), and
+  `obstacles*` has about 250 more (88 with ≥ 0.3 s). Some `obstacles` events
+  are steps onto props, not flat-ground jumps.
+- **Caveats:** these are candidates, not labels. The 30 → 60 fps re-solve should
+  share the timeline, but **the time offset must be verified** in the clip
+  browser. The C++ tag suggester reruns the same heuristics on the resolved
+  data.
+- **Fallback:** where no good transition exists, stance changes rely on
+  inertialization with a longer halflife (0.2 s, decided).
 
 ### 6.3 Controller and controls
 Desired velocity comes from the stick or WASD in **camera space**. Desired
 facing follows the move direction, or the camera while strafing. Springs and
-synchronization follow Holden: velocity/rotation halflife 0.27 s, adjustment
-pos/rot halflife 0.1/0.2 s, clamping 0.15 m.
+sync follow Holden: velocity/rotation halflife 0.27 s, adjustment pos/rot
+0.1/0.2 s, clamping 0.15 m.
 
 | Gait | Fwd / side / back (m/s), initial values to retune from DB stats |
 |---|---|
@@ -235,13 +300,11 @@ pos/rot halflife 0.1/0.2 s, clamping 0.15 m.
 | **Crouch walk** | 1.0 / 0.8 / 0.7 |
 | **Crouch run** | 2.5 / 2.0 / 1.5 |
 
-Stick magnitude blends between walk and run. A gait change uses
-`gait_change_halflife` 0.1 s.
+Stick magnitude blends walk ↔ run. A gait change uses `gait_change_halflife` 0.1 s.
 
-**Stance:** pressing crouch toggles `desiredStance`. The search is restricted
-to frames tagged with that stance (plus `transition`). A stance change
-**forces an immediate search** and uses a longer inertialization halflife
-(0.2 s, tunable) **[D16]**.
+**Stance:** crouch toggles `desiredStance`. The search is restricted to that
+stance's tag (plus `transition`). A stance change forces an immediate search
+and uses a 0.2 s inertialization halflife.
 
 | Action | Gamepad (XInput) | Keyboard / mouse |
 |---|---|---|
@@ -249,41 +312,49 @@ to frames tagged with that stance (plus `transition`). A stance change
 | Walk | — (small deflection) | hold Alt |
 | **Sprint** | hold RT or click LS | hold Shift |
 | **Crouch** (toggle) | B | C |
+| **Jump** | A | Space |
 | Strafe (face camera) | hold LT | hold Ctrl |
 | Camera orbit / zoom | Right stick / LB+RB | RMB drag / wheel |
-| Camera mode: follow → free → presets (front/side/back) | Y | F / 1–3 |
+| Camera mode: follow → free → presets | Y | F / 1–3 |
 | Pause / step one tick / time scale | Start / D-pad → / D-pad ↑↓ | P / `.` / `[` `]` |
 | Reset character | Back | R |
 | Cycle deformer (selected garment) | D-pad ← | Tab |
 | Reload shaders, configs, models | — | F5 |
 | Screenshot / record toggle | — | F12 / F9 |
 | Toggle UI | — | F1 |
-| *(Later)* Jump | A | Space **[D15]** |
 
-### 6.4 Runtime
-- **Query** = current features, with the trajectory replaced by the controller's spring prediction.
-- **Search** every `search_time` (0.1 s), on a large input change (velocity
-  or rotation change thresholds), on a stance change, or at the end of a range.
-  The search covers only valid frames carrying the current stance tag.
-- **Switch** when the best cost beats the current cost and the best frame is
-  not close to the current frame.
-- **Inertialization:** offsets decayed with a critically damped spring
-  (halflife 0.1 s; stance change 0.2 s).
-- **Budget:** at most 1 ms per search with AABB culling. Expected size is
-  about 0.4M frames including mirroring.
+### 6.4 Jump (action with commitment)
+1. **Request:** the Jump button sets `jumpRequested` for a short buffer
+   (0.15 s). The jump is ignored while crouched unless crouch-jump data exists
+   **[D15b]**.
+2. **Search:** an immediate search restricted to frames in a **takeoff window**
+   (the `takeoff` event − 0.4 s … `takeoff` − 0.1 s) of `jump` ranges. The
+   trajectory features pick a standing or running jump by matching speed.
+3. **Commit:** play the jump range through to the `land` event + 0.2 s with
+   **no searching**. The sim bone keeps integrating the clip's root velocity, the
+   controller's desired velocity is ignored, and foot IK is off.
+4. **Resume:** after the land window, searching restarts with the normal tags
+   and inertialization as usual.
+5. Hip height (Y) comes from the animation. The ground stays flat.
+6. **Debug:** takeoff/land markers on the timeline and air time in the HUD.
 
-### 6.5 Animation sources
-All three implement the same `IAnimSource`:
-- `MotionMatching`
-- `ClipPlayer`: a fixed BVH, for deterministic evaluation.
-- `Replay`: a recorded input stream fed into the motion-matching controller.
-  Deterministic given the same DB, tick and config.
+### 6.5 Runtime search
+- **Query** = current features, with the trajectory replaced by the spring prediction.
+- **Search** every `search_time` (0.1 s), on a large input change, on a stance
+  change, on a jump request, or at the end of a range. Only valid frames with
+  the right tags are searched.
+- **Inertialization:** 0.1 s halflife by default, 0.2 s on a stance change.
+- **Budget:** at most 1 ms per search with AABB culling (about 0.4M frames including mirroring).
 
-### 6.6 Debug view
-Overlay the desired and matched trajectories, the sim bone, contacts and foot
-IK targets. A panel shows the current clip, frame and tag, a per-group cost
-breakdown, live feature-weight sliders (they rebuild the weighted features in
-under 100 ms, no DB rebuild), searches per second and a transition timeline.
+### 6.6 Animation sources and debug view
+- `MotionMatching`, `ClipPlayer` (a fixed BVH, deterministic) and `Replay`
+  (recorded input; deterministic given the same DB, tick and config) all
+  implement the same `IAnimSource`.
+- The overlay shows the desired and matched trajectories, the sim bone,
+  contacts and IK targets.
+- A panel shows the clip, frame and tags, a per-group cost breakdown, live
+  feature-weight sliders (no DB rebuild), searches per second and a transition
+  timeline.
 
 ---
 
@@ -294,19 +365,17 @@ under 100 ms, no DB rebuild), searches per second and a transition timeline.
 `parents`, and `morphs: name → sparse {vertIdx, delta}`.
 
 Per tick:
-1. `v = rest + Σ wᵢ·morphᵢ` (sparse adds)
-2. LBS with `bindInv`
-3. Recompute normals (area-weighted) and tangents
+1. `v = rest + Σ wᵢ·morphᵢ`
+2. LBS
+3. Recompute normals and tangents
 
-At Geno's size this is well under 1 ms single-threaded. Add an OpenMP or
-`std::execution::par` loop only if profiling demands it.
+At Geno's size this is well under 1 ms single-threaded.
 
 **Blendshapes:** the loader reads FBX blend channels generically (ufbx). Geno
-has **none**. To exercise the path, the engine creates **procedural test
-morphs** at load (`inflate` along normals, `belly`, `chest` by
-radial falloff around joints), and the **placeholder corrective deformer**
-(§8) can output morph weights or per-vertex offsets for the body **[D19]**.
-The UI has morph-weight sliders and a "show bind pose" toggle.
+has **none**, so the engine creates **procedural test morphs** at load
+(`inflate`, `belly`, `chest`) to exercise the path. The **placeholder
+corrective deformer** (§8) can output morph weights or offsets **[D19]**. The
+UI has morph sliders and a bind-pose toggle.
 
 ---
 
@@ -315,15 +384,17 @@ The UI has morph-weight sliders and a "show bind pose" toggle.
 ### 8.1 Interface
 ```cpp
 struct FrameContext {
-    float dt; int64_t tick; Stance stance;
+    float dt; int64_t tick; Stance stance; bool airborne;
     std::span<const quat> localRot, prevLocalRot;    // (J) Geno order
     std::span<const vec3> globalPos;  std::span<const quat> globalRot;
     vec3 rootVel, rootAngVel;
-    std::span<const vec3> bodyVerts, bodyNormals;    // posed body, world space
+    std::span<const vec3> bodyVerts, bodyNormals;    // posed body, world space (CPU)
+    GpuBuffers gpu;                                  // GL ids of body verts/normals SSBOs (for GPU deformers)
 };
 
 struct DeformOut {
-    std::vector<vec3> verts;                                  // world space, sim-mesh order
+    std::vector<vec3> verts;                                  // world space, sim-mesh order (CPU path)
+    unsigned int glVertexBuffer = 0;                          // set instead by GPU deformers (drawn directly)
     std::unordered_map<std::string, std::vector<float>> scalars; // per-vertex, for heatmaps
 };
 
@@ -342,14 +413,15 @@ public:
 | Deformer | What it does | Status |
 |---|---|---|
 | `static` | rest mesh | real |
-| `lbs` | garment skinned with weights transferred from Geno (§9.3) | real, **the baseline** |
-| `placeholder` | runs the full model path (gather inputs → "infer" → apply output) but inference returns **zero offsets**, so the result equals `lbs`. The HUD shows `PLACEHOLDER`. | **placeholder** |
-| `onnx` | ONNX Runtime session from a manifest. If the `model` path is empty or missing it falls back to `placeholder` with a warning. | code real, **no model shipped** |
-| `glsl_compute` | runs `shaders/user/deform_template.comp` over SSBOs (identity kernel) | **template** |
-| `cuda` | runs `src/deform/cuda/deform_template.cu` (identity kernel), built only with `PG_WITH_CUDA` | **template** |
-| `body_corrective` | the same pattern applied to the body: outputs morph weights or offsets (zeros) | **placeholder** |
+| `lbs` | garment skinned with the Blender-generated weights (§9) | real, **the baseline** |
+| `placeholder` | runs the whole model path, but "inference" returns **zero offsets**, so the result equals `lbs`. The HUD shows `PLACEHOLDER`. | **placeholder** |
+| `onnx` | ONNX Runtime session from a manifest. An empty or missing `model` falls back to `placeholder`. | code real, **no model shipped** |
+| `glsl_compute` | `shaders/user/deform_template.comp` over SSBOs (identity) | **template** |
+| `implicit_mlp` | GLSL MLP evaluated per vertex or per sample with weights in an SSBO (§8.4) | **template; weights random/zero** |
+| `cuda` | `src/deform/cuda/deform_template.cu` (identity), writes GL buffers through interop | **template** (`PG_WITH_CUDA`) |
+| `body_corrective` | the same pattern for the body: morph weights or offsets (zeros) | **placeholder** |
 
-Placeholder sketch (the actual stub to write in P5):
+Placeholder sketch (the stub to write in P5):
 ```cpp
 class PlaceholderDeformer final : public IDeformer {
     LbsDeformer lbs_;            // baseline path
@@ -369,94 +441,114 @@ public:
 ```
 
 ### 8.3 Model manifest (`models/*.model.toml`)
-The manifest maps model tensors to engine semantics, so a new model needs no
-engine code. `models/placeholder.model.toml` ships with an empty `model` path:
-
 ```toml
 name    = "placeholder_tshirt"
-backend = "onnx"                      # onnx | glsl_compute | cuda
+backend = "onnx"                      # onnx | glsl_compute | implicit_mlp | cuda
 model   = ""                          # empty → placeholder behaviour
-target  = "garments/tshirt"           # garment id
-rate_hz = 60                          # engine resamples if different
+target  = "garments/tshirt"
+rate_hz = 60
 joints  = "body22"                    # preset (no fingers/ends) or explicit list
 providers = ["CUDA", "CPU"]
 
 [inputs.pose]      semantic = "joint_rotmats"     frame = "current"   # (1,J,3,3)
 [inputs.pose_prev] semantic = "joint_rotmats"     frame = "previous"
 [inputs.template]  semantic = "target_rest_verts"                     # (V,3)
-[outputs.verts]    semantic = "verts"             space = "unposed"   # engine applies garment LBS
+[outputs.verts]    semantic = "verts"             space = "unposed"
 ```
+- Input semantics: `joint_rotmats | joint_quats | joint_6d | root_vel | root_ang_vel | body_verts | body_normals | target_rest_verts | dt | stance | airborne | state:<name>`.
+- Output spaces: `world | unposed | offset_unposed | offset_world`, plus optional `scalars:<name>` **[D9]**.
+- At load, validate against the session and fail loudly in the UI without crashing. `state:*` tensors are recurrent and cleared by `Reset()`.
 
-- Input semantics: `joint_rotmats | joint_quats | joint_6d | root_vel | root_ang_vel | body_verts | body_normals | target_rest_verts | dt | stance | state:<name>`.
-- Output spaces: `world | unposed | offset_unposed | offset_world`. Outputs may also include `scalars:<name>` **[D9]**.
-- At load, validate names, shapes and dtypes against the session and fail
-  loudly in the UI without crashing. Recurrent `state:*` tensors carry over
-  between ticks and are cleared by `Reset()`.
+### 8.4 Implicit neural models on the GPU **[D24]**
+Validated mechanism (§2.1, T3/T4/T7): MLP weights live in an SSBO and GLSL
+evaluates the network. Two paths:
+
+| Path | Use | Notes |
+|---|---|---|
+| **GLSL** (`implicit_mlp` backend, `shaders/implicit/mlp.glsl`) | Small MLPs (about 4 layers × 64 wide, sine/ReLU): **neural SDF of the body** (collision proxy and penetration metric), per-vertex **neural deformation fields**, debug **sphere-traced visualization** of any implicit | Weights come from a flat `.bin` + layer table in the manifest. fp32. Grid evaluation goes to a 3D texture via `imageStore` for cheap lookups. |
+| **CUDA / ORT CUDA EP** | Larger networks, hash-grid encodings, tensor cores | Writes into GL buffers or textures through CUDA–GL interop (T9, to be confirmed on the target) |
+
+Placeholder: `models/implicit_placeholder.model.toml` has no weights file, so
+the engine generates **random seeded weights at runtime**, purely to exercise
+the path (no model is shipped). The UI shows an **"implicit inspector"**:
+sphere-trace the implicit over the scene, slice planes, and a heatmap of the
+SDF sampled at garment vertices.
 
 ---
 
-## 9. Garments (`garment/`)
+## 9. Garments (Blender pipeline) **[D8]**
 
-### 9.1 Sources (free) **[D8]**
+### 9.1 Sources (free)
 
 | Source | What | License | Fits Geno? |
 |---|---|---|---|
-| **Procedural (ours)** | tube skirt, circle skirt, cape pinned at the shoulders, generated from Geno landmarks at load | ours | yes, by construction |
-| **GarmentCode** (`maria-korosteleva/GarmentCode`) | parametric sewing patterns: T-shirt, shirt, hoodie, pants, skirts, dresses, with a built-in drape simulator (NVIDIA Warp) | **MIT** | **yes**: generate made-to-measure from Geno measurements and drape on Geno's bind-pose mesh |
-| **NeuralClothSim** samples (`hbertiche/NeuralClothSim/body_models/`) | `tshirt.obj`, `pants.obj` (+`pants_pin.npy`) on SMPL; `tshirt.obj` on a Mixamo mannequin | non-commercial research | needs refit (§9.2) |
+| **Procedural** (Blender script) | tube/flared skirt, cape pinned at the shoulders, built from Geno's bone landmarks | ours | yes, by construction |
+| **GarmentCode** (`maria-korosteleva/GarmentCode`) | parametric sewing patterns (T-shirt, shirt, hoodie, pants, skirts, dresses) with a built-in drape sim (NVIDIA Warp) | **MIT** | **yes**: made-to-measure from Geno measurements, draped on Geno's bind-pose OBJ |
+| **NeuralClothSim** samples | `tshirt.obj`, `pants.obj` on SMPL; `tshirt.obj` on a Mixamo mannequin | non-commercial research | needs alignment + shrinkwrap in Blender |
 
-Recommended start: procedural skirt and cape (available right away), plus a
-GarmentCode T-shirt and pants made for Geno (a one-off offline export to OBJ
-with UVs). The NCS samples come second, through the fitter.
+**Initial selection (accepted):** procedural skirt and cape, then a GarmentCode
+T-shirt and pants made for Geno.
 
-### 9.2 Fitter (`playground.exe --fit-garment <cfg>` with a UI)
-1. Coarse align: an interactive similarity transform with an ImGui gizmo, plus
-   per-axis scale. The result is saved in the garment TOML.
-2. **Push-out:** move any vertex inside the body outward along the
-   closest-surface normal, plus an offset (default 3 mm).
-3. **Relax:** a few iterations of Laplacian smoothing with edge-length preservation, keeping pinned vertices fixed.
-4. Save `assets/garments/<id>/garment.obj` and `garment.toml` (transform, pins, material, sim/render maps).
+### 9.2 Pipeline (`playground/tools/blender/`, run headless: `python <script>.py ...` in the bpy venv)
+1. `export_geno_body.py`: `Geno.fbx` → bind-pose `geno_bind.obj` (meters, Y-up) + a measurement TOML for GarmentCode.
+2. *(GarmentCode, run once, outside the engine)*: generate and drape the
+   garments on `geno_bind.obj` → garment OBJ with UVs.
+3. `fit_garment.py` (only for non-GarmentCode garments): manual or landmark
+   alignment, then Blender **Shrinkwrap (outside surface, +3 mm)**, then
+   **Corrective/Laplacian smooth**.
+4. **`skin_garment.py`: automatic skinning weights** using **Robust Skin
+   Weights Transfer** (Abdrashitov et al., SIGGRAPH Asia 2023, reference code
+   MIT):
+   - closest-point barycentric transfer where distance < 5% of the body
+     diagonal and the normals agree within 30° (flipped normals allowed)
+   - **biharmonic inpainting** (cotan Laplacian + mass, scipy sparse solve) everywhere else
+   - limit to 4 influences and normalize
+   - optional smoothing iterations for skirts
+5. Export a **skinned garment FBX** (armature-parented). The engine loads it
+   with ufbx, the same loader it uses for Geno.
 
-### 9.3 Skin binding (for `lbs` and `unposed` outputs)
-Copy the weights of the nearest Geno vertex, then run N smoothing iterations
-(default 10; skirts 50–100, as in NCS's `blend_weights_smoothing_iterations`).
-Results are cached next to the garment.
+**Prototype validated** (`skin_garment_prototype.py`, bpy 5.0.1, Geno + a
+1,536-vertex procedural flared skirt). Edge-length ratio after LBS, posed vs
+rest:
 
-### 9.4 Sim mesh vs render mesh
-Seams make the render mesh larger. Store a `renderToSim` index map, gather it
-each tick, and recompute normals and tangents after deformation.
+| Pose | Nearest-point transfer (NCS-style, no smoothing) | **RSWT** |
+|---|---|---|
+| Stride (thighs −45°/+35°) | max 19.6, p99 12.2 | **max 2.5, p99 1.47** |
+| Crouch (thighs −80°, knees +100°) | max 20.5, p99 9.1 | **max 4.5, p99 2.66** |
+
+RSWT is **required**: nearest-point transfer tears skirts apart between the
+legs. Even with RSWT, LBS skirts stretch badly in a deep crouch. That is the
+expected baseline for neural models to beat, and the metrics record it.
+
+### 9.3 Sim mesh vs render mesh
+Seams make the render mesh larger. Store a `renderToSim` map, gather it each
+tick, and recompute normals and tangents after deformation.
 
 ---
 
 ## 10. Rendering (`render/`)
 
-Start from GenoView's deferred renderer (MIT) and upgrade it:
+Start from GenoView's deferred renderer (MIT), ported to raylib 6.0, and upgrade it:
 
-1. **Shadow:** sun, an orthographic frustum fitted to the character + garment
-   bounds, 2048², PCF.
-2. **GBuffer:** albedo, normal (octahedral), roughness / metallic / sheen /
-   **shading-model id**, depth. Garments are **two-sided**: flip the normal on
-   back faces and optionally tint the back side.
-3. **SSAO + blur:** GenoView's.
-4. **Lighting:** GGX + **IBL** (HDRI → cubemap, irradiance SH9, GGX prefilter,
-   BRDF LUT, cached in `data/cache/ibl/`). Shading models: `standard`, `cloth`
-   (Charlie sheen + wrap diffuse), `skin` (wrap diffuse), `unlit`, `heatmap`.
+1. **Shadow:** sun, an orthographic frustum fitted to the character + garments, 2048², PCF.
+2. **GBuffer** (`rlDisableColorBlend`): albedo, normal (octahedral),
+   roughness / metallic / sheen / **shading-model id**, depth. Garments are
+   **two-sided** (normal flipped on back faces).
+3. **SSAO + blur.**
+4. **Lighting:** GGX + **IBL** (HDRI → cubemap, SH9 irradiance, GGX prefilter,
+   BRDF LUT, cached). Models: `standard`, `cloth` (Charlie sheen + wrap
+   diffuse), `skin` (wrap diffuse), `unlit`, `heatmap`.
 5. **Sky:** the HDRI background.
-6. **Post:** exposure → **AgX** tonemap (ACES optional) → FXAA (GenoView's).
-7. **Overlay:** debug lines, trajectories, skeleton, gizmos, ImGui.
+6. **Post:** exposure → **AgX** (ACES optional) → FXAA.
+7. **Overlay:** debug lines, trajectories, skeleton, gizmos, implicit inspector, ImGui.
 
-**Artifact view:** GenoView's procedural grid can be applied to the ground,
-the body and the garments. It makes sliding, stretching and penetration easy
-to see.
-
-**Custom shaders:** a material TOML references a GLSL function
-`Surface evaluate(SurfaceIn)` that is injected into the GBuffer pass. Its
-uniforms appear in the UI automatically. Users can also add post passes in
-`shaders/user/post_*.fs`. Everything hot-reloads, and a compile error keeps the
-last good program and shows the log.
-
-**Debug modes:** lit, albedo, normals, AO, wireframe overlay, heatmap of any
-`DeformOut.scalars` channel (turbo/viridis), and body/garment visibility.
+**Artifact view:** GenoView's procedural grid on the ground, body and garments.
+**Custom shaders:** material TOML → GLSL `Surface evaluate(SurfaceIn)`
+injected into the GBuffer pass. Uniforms appear in the UI automatically. Users
+can add post passes. Everything hot-reloads, and a compile failure keeps the
+last good program (validated, T2).
+**Debug modes:** lit, albedo, normals, AO, wireframe, heatmap of any
+`DeformOut.scalars`, and visibility toggles.
 
 ---
 
@@ -468,26 +560,26 @@ last good program and shows the log.
 [scene]      hdri = "data/assets/hdri/studio.hdr"   ground_size = 50.0   artifact_grid = true
 [camera]     mode = "follow"  distance = 3.5  height = 1.3
 [character]  fbx = "data/geno/Geno.fbx"  anim = "motion_matching"  db = "data/mm"
-[[garments]] id = "skirt_procedural"  material = "materials/cotton.toml"  deformer = "lbs"
-[[garments]] id = "tshirt_garmentcode" material = "materials/jersey.toml" deformer = "models/placeholder.model.toml"
+[[garments]] fbx = "data/garments/skirt_procedural.fbx"  material = "materials/cotton.toml" deformer = "lbs"
+[[garments]] fbx = "data/garments/tshirt_garmentcode.fbx" material = "materials/jersey.toml" deformer = "models/placeholder.model.toml"
 ```
 
 Scenes:
 - `default.toml`: the motion-matching playground
-- `turntable.toml`: bind or idle pose with an auto-orbiting camera
-- `clip_browser.toml`: GenoView-style viewer and tagging tool
-- `eval_track.toml`: a scripted input (walk → 180° turn → sprint → stop →
-  crouch walk → stand → strafe circle) run through `Replay`. It is the
-  **standard repeatable benchmark**.
+- `turntable.toml`: an auto-orbiting camera
+- `clip_browser.toml`: viewer and tagging tool
+- `eval_track.toml`: a scripted input (walk → 180° turn → sprint → **running
+  jump** → stop → **standing jump** → crouch walk → stand → strafe circle) run
+  through `Replay`. It is the **standard repeatable benchmark**.
 
 | Asset | Source | License | In git? |
 |---|---|---|---|
 | Geno (`Geno.fbx`, bind/stance BVH) | orangeduck/lafan1-resolved | non-commercial research | no, fetched |
 | LAFAN1-resolved BVH | theorangeduck.com | CC BY-NC-ND 4.0 | no, fetched |
 | 100STYLE-retarget BVH (Neutral, Crouched) | theorangeduck.com | CC BY 4.0 | no, fetched |
-| Garments | §9.1 | §9.1 | procedural params only; generated OBJs git-ignored **[D11]** |
+| Garments (skinned FBX) | §9 | §9 | no, generated by the Blender tools |
+| LAFAN1 tag candidates (timestamps only) | our scan | ours | **yes** (`docs/playground/data/`) |
 | HDRIs, fabric/ground textures | Poly Haven / ambientCG | CC0 | no, fetched |
-| Props (boxes, 1 m pole, ramp) | procedural | ours | generated |
 | Neural models | — | — | **none, placeholders only** |
 
 ---
@@ -499,28 +591,25 @@ to `runs/<timestamp>/metrics.csv`:
 
 | Metric | Definition |
 |---|---|
-| Penetration % / mean depth | garment verts behind the nearest body vertex's normal (NCS-style) |
-| Stretch | edge length / rest: mean, max, % > 1.1 |
+| Penetration % / mean depth | garment verts behind the nearest body vertex's normal (NCS-style); optionally against the implicit body SDF |
+| Stretch | edge length / rest: mean, max, p99, % > 1.2 (same as §9.2) |
 | Jitter | mean ‖second difference‖ of vertex positions |
-| Deformer ms | CPU timer plus GPU timestamp queries |
+| Deformer ms | CPU timer plus GL timestamp queries (T3) |
 | Frame ms | per stage: MM / body / deform / render |
 
-**Recording** (`runs/<timestamp>/`):
-- `input.bin` (replayable)
-- `poses.npy` (T, J, 4) with `root.npy`, the format the Python `ncs` side reads **[D20]**
-- optional `garment_<id>.npy` (T, V, 3)
-- `poses.bvh`
-- PNG frames or MP4 (via an ffmpeg pipe if `ffmpeg.exe` is on PATH)
+Metrics are also **split by motion state** (stand / crouch / airborne /
+transition), so jump and crouch failures show up separately.
 
-**A/B:** each garment can hold several deformers, and Tab cycles them. *Split*
-mode draws a second Geno 1 m to the side with deformer B, driven by the same
-pose.
+**Recording** (`runs/<timestamp>/`): `input.bin` (replayable), `poses.npy`
+(T,J,4) + `root.npy` **[D20]**, optional `garment_<id>.npy` (T,V,3),
+`poses.bvh`, and PNG/MP4 via an ffmpeg pipe.
 
+**A/B:** Tab cycles deformers. *Split* mode draws a second Geno 1 m to the side with deformer B.
 **Headless:** `playground.exe --scene scenes/eval_track.toml --headless --ticks 3600 --deformer <manifest>`.
 
 ---
 
-## 13. Performance budget (60 fps @ 1080p, RTX 3060-class) **[D2]**
+## 13. Performance budget (60 fps @ 1080p, RTX 3060-class)
 
 | Stage | Budget |
 |---|---|
@@ -536,12 +625,13 @@ pose.
 
 | Area | Tests |
 |---|---|
+| gpu | `tools/gpu_validate` T0–T9 on the target machine (P0 gate) |
 | math | quat identities, slerp endpoints, spring convergence |
-| anim | BVH parse of `Geno_bind.bvh`: 75 joints, FK hips height ≈ 0.855 m; mirror twice = identity |
-| mm | 27 features; querying with a DB frame's own features returns that frame; AABB search = brute-force result; tag filter never returns a wrong-stance frame; inertialization offset → 0 with no pop at the switch; replay determinism |
-| body | zero morphs + bind pose → rest verts; identity LBS is a no-op; normals are unit length |
-| garment | push-out leaves 0 penetrating verts on the bind pose; skin weights sum to 1 |
-| deform | `placeholder` == `lbs` bit-for-bit; manifest validation errors; ONNX path with a **test-only tiny identity graph generated in the test** (never shipped) |
+| anim | parse `Geno_bind.bvh`: 75 joints, FK hips ≈ 0.855 m; mirror twice = identity |
+| mm | 27 features; self-query returns the same frame; AABB = brute force; tag filter never returns a wrong-stance frame; jump commit does no search until `land`; inertialization offset → 0 with no pop; replay determinism |
+| body | zero morphs + bind pose → rest; identity LBS is a no-op; normals are unit |
+| garment | Blender output: weights sum to 1, ≤ 4 influences, 0 penetrating verts on the bind pose; stretch regression vs the table in §9.2 |
+| deform | `placeholder` == `lbs` bit-for-bit; manifest validation; ONNX path with a **test-only identity graph generated in the test**; `implicit_mlp` GPU vs CPU parity (as in T3) |
 | render | a hidden-window frame renders with no GL errors; every material shader compiles |
 
 ---
@@ -553,23 +643,21 @@ user about its open decisions.**
 
 | # | Phase | Deliverable | Gate decisions |
 |---|---|---|---|
-| P0 | Shell | CMake/vcpkg build, raylib window, ImGui, fixed tick, cameras, ground grid, TOML config + hot reload | D1, D3, D18 |
-| P1 | Geno + clips | ufbx Geno load, CPU LBS, procedural morphs, BVH loader, FK, mirror, clip browser (GenoView parity) | D7, D19 |
+| P0 | Shell | **run `gpu_validate` on the Windows target (T0–T9)**; CMake/vcpkg build, raylib window, glad via `rlGetProcAddress`, ImGui, fixed tick, cameras, ground grid, TOML + hot reload | D18 |
+| P1 | Geno + clips | ufbx Geno load, CPU LBS, procedural morphs, BVH loader, FK, mirror, clip browser | D19 |
 | P2 | Rendering | deferred PBR + IBL + shadows + SSAO + AgX + FXAA, materials incl. cloth, artifact grid, custom shader hook | D11, D14 |
-| P3 | Motion matching | tags + clip-browser tagging, DB build, AABB search, controller (walk/run/sprint/crouch/strafe), inertialization, sync/adjust/clamp, foot IK, debug panel, record/replay | D6, D15, D16 |
-| P4 | Garments | procedural skirt/cape, fitter, GarmentCode + NCS imports, skin binding, `lbs` baseline | D8 |
-| P5 | Deformers + eval | `IDeformer`, placeholder/onnx/body_corrective stubs, manifest, metrics HUD, recording, A/B, eval track, headless | D9, D10, D13, D20 |
-| P6 | GPU extras | `glsl_compute` + `cuda` templates, CUDA–GL interop, video capture | D10 |
+| P3 | Motion matching | tags + tag suggester + clip-browser tagging (seeded from the scan CSVs), DB build, AABB search, controller (walk/run/sprint/crouch/strafe/**jump**), inertialization, sync/adjust/clamp, foot IK, debug panel, record/replay | D6, D15b |
+| P4 | Garments | Blender tools (`export_geno_body`, `fit_garment`, `skin_garment`), procedural skirt/cape, GarmentCode T-shirt + pants, `lbs` baseline | D23 |
+| P5 | Deformers + eval | `IDeformer`, placeholder/onnx/body_corrective stubs, manifest, metrics HUD (split by state), recording, A/B, eval track, headless | D9, D10, D13, D20 |
+| P6 | GPU extras | `glsl_compute`, `implicit_mlp` + implicit inspector, `cuda` template + CUDA–GL interop, video capture | D10, D24 |
 
 ---
 
 ## 16. References
-- orangeduck/Motion-Matching (MIT): `controller.cpp`, `database.h`, `spring.h`, `resources/generate_database.py`
-- orangeduck/GenoView (MIT): deferred renderer, SSAO, shadows, grid shader, Geno binary loader
-- orangeduck/lafan1-resolved, 100style-retarget, zeroeggs-retarget: Geno character + data
-- Clavet, *Motion Matching and The Road to Next-Gen Animation*, GDC 2016
-- Holden et al., *Learned Motion Matching*, SIGGRAPH 2020; Holden, *Code vs Data Driven Displacement*
-- Mason et al., *Real-Time Style Modelling of Human Locomotion…* (100STYLE), 2022
-- Harvey et al., *Robust Motion In-Betweening* (LAFAN1), SIGGRAPH 2020
+- orangeduck/Motion-Matching (MIT), orangeduck/GenoView (MIT); lafan1-resolved, 100style-retarget, zeroeggs-retarget
+- raysan5/raylib 6.0 (zlib); rlImGui; ufbx; ONNX Runtime
+- Clavet, *Motion Matching and The Road to Next-Gen Animation*, GDC 2016; Holden et al., *Learned Motion Matching*, SIGGRAPH 2020
+- Harvey et al., *Robust Motion In-Betweening* (LAFAN1), SIGGRAPH 2020; Mason et al., *Real-Time Style Modelling of Human Locomotion…* (100STYLE), 2022
+- Abdrashitov et al., *Robust Skin Weights Transfer via Weight Inpainting*, SIGGRAPH Asia 2023 (rin-23/RobustSkinWeightsTransferCode, MIT)
 - Korosteleva et al., *GarmentCode* (2023) / *GarmentCodeData* (2024)
 - Bertiche et al., *Neural Cloth Simulation*, SIGGRAPH Asia 2022
