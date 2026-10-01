@@ -154,3 +154,18 @@ pytest
 - Batched ops over poses: leading batch dim `B`
 - No TensorFlow/Keras — pure PyTorch throughout
 - Keep physics functions pure (no `nn.Module`) for easy `gradcheck`
+
+---
+
+## Playground Engine (`playground/`, spec only so far)
+
+Real-time playground for evaluating neural cloth/body models: motion-matching character (LAFAN1),
+LBS + blendshapes, PBR rendering, ONNX Runtime / PyTorch / CUDA deformers.
+
+- Spec: `docs/playground/SPEC.md`
+- Open decisions: `docs/playground/DECISIONS.md`
+
+**Rule: ask questions instead of making assumptions.** Before you implement a playground phase,
+check its gate decisions in `DECISIONS.md`. If any are still open, ask the user. Don't silently
+pick the recommended default. Record each answer under *Resolved* with the date. Keep the design
+simple: it is a fast-iteration playground, not a game engine.
