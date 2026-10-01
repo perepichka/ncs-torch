@@ -161,7 +161,8 @@ pytest
 
 Real-time **C++ / Windows-only** playground (raylib 6.0, GL 4.3) for evaluating neural cloth/body
 models: the Geno character with motion matching on orangeduck's lafan1-resolved + 100style-retarget
-data (walk/run/sprint/crouch/jump, 60 Hz), CPU LBS + blendshapes, deferred PBR rendering, and
+data (walk/run/sprint/crouch/jump, 60 Hz), **GPU-resident** compute skinning + blendshapes (hardware
+GPU only, no software rendering; CPU runs animation only), deferred PBR rendering, and
 ONNX Runtime / GLSL-compute / implicit-MLP / CUDA deformers. Garments are auto-skinned offline in
 Blender (Robust Skin Weights Transfer). **No trained models are shipped. Neural parts are placeholder code.**
 The engine shares only files (`.npy`, `.onnx`) with the Python `ncs/` package.

@@ -5,7 +5,7 @@ body models** on the **Geno** character, driven by **motion matching** on
 orangeduck's retargeted datasets (LAFAN1-resolved + 100STYLE-retarget). It is a
 playground built for fast iteration. It is not a game engine.
 
-> **Status:** draft spec, revision 3. Decisions marked **[D#]** are tracked in
+> **Status:** draft spec, revision 4 (GPU-resident pipeline). Decisions marked **[D#]** are tracked in
 > [`DECISIONS.md`](DECISIONS.md). Defaults here are recommendations until the
 > user confirms them. Before implementing a phase, resolve its open decisions
 > with the user. **Ask. Don't assume.**
@@ -21,8 +21,9 @@ playground built for fast iteration. It is not a game engine.
 ### Goals
 1. Drive Geno interactively (gamepad or keyboard) with **motion matching**:
    idle, walk, run, **sprint**, **crouch** (idle/walk/run), strafe and **jump**.
-2. **LBS + blendshapes** on the CPU, so it is simple and testable. Upload the
-   result to the GPU each tick.
+2. **GPU skinning + blendshapes** as compute passes, the way modern engines do
+   it (e.g. Unreal's GPU skin cache). Geometry stays on the GPU; the CPU only
+   sends pose data.
 3. Render with modern shading that looks good enough to judge cloth: deferred
    PBR, IBL, shadows, SSAO, a sheen cloth BRDF, HDR + AgX tonemap, and a
    GenoView-style "artifact grid" view.
@@ -40,6 +41,7 @@ playground built for fast iteration. It is not a game engine.
 - Animation state machines or blend trees (motion matching plus tags replaces them)
 - Learned Motion Matching
 - Producing or shipping any trained model
+- Software rendering of any kind. **Hardware GPU only.**
 - Linux, macOS, consoles, web. **Windows only.**
 
 ---
@@ -49,42 +51,58 @@ playground built for fast iteration. It is not a game engine.
 | Concern | Choice | Why |
 |---|---|---|
 | Language / toolchain | **C++20, MSVC 2022, CMake ≥ 3.25, vcpkg manifest** **[D18]** | Standard on Windows |
-| Window, GL, input, gamepad | **raylib 6.0, OpenGL 4.3 backend** (`-DOPENGL_VERSION=4.3`); **validated in §2.1** | Holden's MIT Motion-Matching demo and MIT GenoView (deferred + shadows + SSAO) are both raylib, so their code ports almost verbatim |
+| Window, GL, input, gamepad | **raylib 6.0, OpenGL 4.3+ backend** (`-DOPENGL_VERSION=4.3`, NVIDIA drivers give 4.6) on a **hardware GPU** **[D26]**; API checked in §2.1 | Holden's MIT Motion-Matching demo and MIT GenoView (deferred + shadows + SSAO) are both raylib, so their code ports almost verbatim |
 | Raw GL beyond rlgl | a **glad 4.6** loader initialized with `rlGetProcAddress` | Timer queries, `glGetTexImage`, DSA, etc. rlgl doesn't wrap everything. |
 | UI | Dear ImGui + **rlImGui** + **ImPlot** | Panels and live metric plots |
 | Character / mesh import | **ufbx** (single-file, MIT) for `Geno.fbx` and skinned garment FBX | Reads skin, bind pose and blendshapes directly |
 | Images / HDR | stb_image, stb_image_write | |
 | Config | **TOML** via toml++ (header-only) | Readable, hot-reloadable |
 | Nearest-neighbor | nanoflann | Penetration metric |
-| NN inference | **ONNX Runtime** (official GPU package: CUDA EP, CPU EP fallback) **[D10]** | |
-| CUDA (optional) | CUDA Toolkit 12.x, CMake option `PG_WITH_CUDA` | Custom kernels, CUDA–GL interop |
+| NN inference | **ONNX Runtime** GPU package, **CUDA EP**, bound to GL buffers through CUDA–GL interop (no host copies) **[D10]** | CPU EP is used only by unit tests |
+| CUDA | CUDA Toolkit 12.x, CMake option `PG_WITH_CUDA` (on by default for the NVIDIA target) | ORT CUDA EP, custom kernels, CUDA–GL interop |
 | Offline asset tools | **Blender** via the `bpy` wheel (+ scipy) in a Python 3.11 venv | Garment skinning (§9). The engine itself never runs Python. |
 | Tests | doctest + CTest | |
 
-**One rule keeps this simple:** *the CPU owns the canonical state.* Skeleton,
-skinning, blendshapes and garment vertices live in CPU arrays and upload to GL
-buffers once per tick. Body + garments total around 30k vertices, which is under
-1 MB per tick. GPU deformers write into GL buffers that the renderer draws
-directly. T5 and T9 in §2.1 cover that path, and the result can be read back
-when metrics need it.
+**One rule keeps this simple: the GPU owns all geometry.**
+- **The CPU runs animation only:** controller, motion matching, pose and IK. Per
+  tick it uploads one small buffer of joint matrices (75 × mat4 ≈ 5 KB) plus
+  morph weights and other per-tick constants.
+- **Everything per-vertex is a GPU compute pass:** morphs → skinning → deformers
+  (GLSL, CUDA or ONNX Runtime via interop) → normals/tangents → draw. Results
+  stay in SSBOs that are bound directly as vertex buffers, as in T5 and T10.
+- **Readback is only for metrics and recording.** It is asynchronous: a fence (T11)
+  lets the CPU read a frame or two late without stalling. Metrics are reduced on
+  the GPU first, so only a few floats come back.
+- **CPU implementations of LBS, morphs and metrics exist only as test oracles**
+  for GPU-vs-CPU parity tests. They are never on the frame path.
 
-### 2.1 raylib validation (done, `playground/tools/gpu_validate/`)
+### 2.1 raylib validation (`playground/tools/gpu_validate/`)
 A standalone CMake project pulls raylib **6.0** and checks every GPU feature
-this spec relies on. It ran on Mesa llvmpipe (GL 4.5 core, a software
-renderer) in the dev sandbox:
+this spec relies on.
+
+> **Hardware validation is still pending. It must run on the Windows/NVIDIA
+> target.** The dev sandbox has no GPU, so the run below used Mesa llvmpipe, a
+> software rasterizer, with `--allow-software`. That run only proves the API
+> usage and shader code are correct. It says nothing about GPU behavior or
+> timings. Without that flag, the validator **fails T1 on any software
+> rasterizer** (llvmpipe, WARP, SwiftShader, Microsoft Basic Render, …).
+
+API-only results:
 
 | Test | Result |
 |---|---|
-| T0 Raw GL entry points through `rlGetProcAddress` | PASS |
-| T1 GL 4.3+ core context with compute; limits printed | PASS |
-| T2 A broken shader returns id 0 without crashing (hot-reload fallback) | PASS |
-| T3 **Implicit MLP (3-64-64-64-1, sine) in a compute shader**, weights in an SSBO: GPU vs CPU max error 4.1e-8 over 110k points; GL timer query works | PASS |
-| T4 **Sphere-traced neural implicit** in a fragment shader reading the SSBO; image saved | PASS |
-| T5 Compute shader writes vertices into an SSBO that is drawn directly as a vertex buffer (zero-copy GPU deformer) | PASS |
-| T6 Float MRT G-buffer (3× RGBA16F + RGBA32F + depth), HDR and negative values preserved | PASS (after disabling blend, see below) |
-| T7 Compute `imageStore` into an rgba32f texture | PASS |
-| T8 `#version 450` shaders compile in the requested 4.3 context | PASS (driver-dependent) |
+| T0 Raw GL entry points through `rlGetProcAddress` | PASS (API-only) |
+| T1 **Hardware GPU** (software rasterizers rejected) + GL 4.3+ core context with compute; vendor and limits printed | PASS (API-only, `--allow-software`) |
+| T2 A broken shader returns id 0 without crashing (hot-reload fallback) | PASS (API-only) |
+| T3 **Implicit MLP (3-64-64-64-1, sine) in a compute shader**, weights in an SSBO: GPU vs CPU max error 4.1e-8 over 110k points; GL timer query works | PASS (API-only) |
+| T4 **Sphere-traced neural implicit** in a fragment shader reading the SSBO; image saved | PASS (API-only) |
+| T5 Compute shader writes vertices into an SSBO that is drawn directly as a vertex buffer (zero-copy GPU deformer) | PASS (API-only) |
+| T6 Float MRT G-buffer (3× RGBA16F + RGBA32F + depth), HDR and negative values preserved | PASS (API-only; after disabling blend, see below) |
+| T7 Compute `imageStore` into an rgba32f texture | PASS (API-only) |
+| T8 `#version 450` shaders compile in the requested 4.3 context | PASS (API-only; driver-dependent) |
 | T9 **CUDA–GL interop**: CUDA writes the GL buffer from T5 | compiles and links; **must run on the Windows/NVIDIA target** (no GPU in the sandbox) |
+| T10 **GPU skinning + sparse morph targets** in one compute pass, Geno-sized (10,329 verts, 75 bones, 4 influences, vertex-major sparse deltas), vs CPU reference | PASS (API-only) |
+| T11 Fence sync for deferred (non-stalling) readback | PASS (API-only) |
 
 Rules that came out of the validation:
 - raylib **enables alpha blending by default**. The G-buffer and any
@@ -95,8 +113,9 @@ Rules that came out of the validation:
   `Rectangle`, …). Isolate Win32, CUDA and ORT code in their own `.cpp` files.
 - raylib asks for a 4.3 context. NVIDIA drivers normally return 4.6 core, so
   `#version 450/460` should work there. P0 confirms this on the target with the validator.
-- **P0 gate:** run `gpu_validate.exe` (configured with `-DPG_WITH_CUDA=ON`) on
-  the Windows machine. T0–T9 must all pass.
+- **P0 gate:** run `gpu_validate.exe` (configured with `-DPG_WITH_CUDA=ON`, and
+  **without** `--allow-software`) on the Windows/NVIDIA machine. T0–T11 must all
+  pass. Record the GPU timings from T3 and T10 in `DECISIONS.md`.
 
 ---
 
@@ -159,11 +178,11 @@ playground/
 │   ├── math/       vec, quat, mat, spring (Holden-style), transforms
 │   ├── anim/       Skeleton, Pose, BVH loader, FK, mirror, ClipPlayer, FootIK
 │   ├── mm/         Database, Tags, Features, Search (AABB), Controller, Jump, Inertializer, Recorder/Replay
-│   ├── body/       BodyModel (ufbx loader), Morphs, LBS (CPU), Normals
-│   ├── garment/    Garment asset (skinned FBX via ufbx), sim/render mesh maps
+│   ├── body/       BodyModel (ufbx loader → GPU buffers), morph+skin compute pass, GPU normals/tangents
+│   ├── garment/    Garment asset (skinned FBX via ufbx → GPU buffers), sim/render gather map
 │   ├── deform/     IDeformer, registry, Lbs/Static, Placeholder, Onnx, GlslCompute, ImplicitMlp, Cuda (.cu, own TU)
 │   ├── render/     Renderer (deferred), GBuffer, Shadow, SSAO, IBL, Post, Materials, DebugDraw
-│   ├── eval/       Metrics, CSV/NPY writers, Capture
+│   ├── eval/       GPU metric passes + reductions, fenced async readback, CSV/NPY writers, Capture
 │   └── ui/         ImGui panels
 ├── shaders/        GLSL: gbuffer, lighting, ssao, shadow, post, materials/, user/, implicit/
 ├── scenes/         default.toml, turntable.toml, eval_track.toml, clip_browser.toml
@@ -186,21 +205,24 @@ models come in as `.onnx` or weight files.
 while (!WindowShouldClose()) {
     input.Poll();
     acc += clock.FrameDt() * timeScale;
-    while (acc >= kTickDt) {                             // fixed 60 Hz
+    while (acc >= kTickDt) {                             // fixed 60 Hz, CPU: animation only
         controller.Update(input, camera, kTickDt);       // desired vel/facing/stance/jump, springs
         animSource->Step(kTickDt, pose);                 // MotionMatching | ClipPlayer | Replay
         footIk.Apply(pose);                              // optional, disabled while airborne
-        body.Update(pose, morphWeights);                 // morphs + LBS + normals (CPU)
-        for (auto& g : garments) g.deformer->Step(ctx, g.out);
-        metrics.Update(ctx); recorder.Update(ctx);
+        gpuFrame.PushPose(pose, morphWeights);           // joint matrices + morph weights -> SSBO (~5 KB)
         acc -= kTickDt;
     }
-    renderer.Upload(body, garments);
-    renderer.Draw(scene, camera);
+    // GPU: one compute chain per frame for the latest tick (all buffers GPU-resident)
+    body.Dispatch(gpuFrame);                             // morphs + skinning + normals/tangents (compute)
+    for (auto& g : garments) g.deformer->Dispatch(gpuFrame, g.out);   // GLSL / CUDA / ORT-CUDA via interop
+    metrics.Dispatch(gpuFrame);                          // GPU reductions; async readback via fences (T11)
+    recorder.Collect();                                  // reads fenced results from 1-2 frames ago, never stalls
+    renderer.Draw(scene, camera);                        // draws SSBOs directly as vertex buffers
     ui.Draw();
 }
 ```
-`--headless` runs the same loop with a hidden window and no presentation (metrics and capture only).
+`--headless` runs the same loop with a hidden window and no presentation
+(metrics and capture only). It still requires the hardware GPU.
 
 ---
 
@@ -358,18 +380,24 @@ and uses a 0.2 s inertialization halflife.
 
 ---
 
-## 7. Body: LBS + blendshapes (`body/`)
+## 7. Body: GPU skinning + blendshapes (`body/`)
 
-`BodyModel` stores, on the CPU: `restVerts (V,3)`, `restNormals`, `uvs`,
-`indices (uint32)`, `boneIdx (V,4) u8`, `boneW (V,4) f32`, `bindInv (J, 4x4)`,
-`parents`, and `morphs: name → sparse {vertIdx, delta}`.
+`BodyModel` is loaded once with ufbx and uploaded to **immutable GPU buffers**:
+- vertex records `{restPos, restNormal, boneIdx u8x4→uvec4, boneW vec4}`
+- `uvs` and `indices`
+- **vertex-major sparse morph deltas**: per-vertex offset table + `(delta.xyz, morphIdx)` entries. No atomics needed (T10 layout).
+- face adjacency (CSR) for normal recomputation
 
-Per tick:
-1. `v = rest + Σ wᵢ·morphᵢ`
-2. LBS
-3. Recompute normals and tangents
+Per frame there are three GPU passes, all compute, with outputs drawn directly:
+1. **Morph + skin** (one pass, as in T10):
+   `p = rest + Σ w[m]·δ` (sparse), then `M = Σ wᵢ·skin[boneᵢ]`, output `M·p` and the rotated normal.
+2. **Normals/tangents:** per-vertex gather over adjacent faces (CSR), used when
+   morphs or deformers change the surface. Pure skinning uses the skinned normal from pass 1.
+3. Results go to `bodyPos/bodyNrm` SSBOs, which the G-buffer pass and every
+   garment deformer read (collision inputs, metrics).
 
-At Geno's size this is well under 1 ms single-threaded.
+CPU side per tick: `skin[j] = global[j] · bindInv[j]` for 75 joints, plus morph
+weights. The **CPU LBS/morph code lives only in `tests/`** as the parity oracle.
 
 **Blendshapes:** the loader reads FBX blend channels generically (ufbx). Geno
 has **none**, so the engine creates **procedural test morphs** at load
@@ -381,30 +409,31 @@ UI has morph sliders and a bind-pose toggle.
 
 ## 8. Deformers: neural embedding, placeholders only (`deform/`)
 
-### 8.1 Interface
+### 8.1 Interface (GPU-first)
+Deformers read GPU buffers and write GPU buffers. Small per-tick pose data
+also comes as CPU values, for building network inputs.
 ```cpp
-struct FrameContext {
+struct GpuFrame {                          // everything a deformer may read this frame
     float dt; int64_t tick; Stance stance; bool airborne;
-    std::span<const quat> localRot, prevLocalRot;    // (J) Geno order
-    std::span<const vec3> globalPos;  std::span<const quat> globalRot;
+    std::span<const quat> localRot, prevLocalRot;   // (J) Geno order, CPU copy (tiny)
     vec3 rootVel, rootAngVel;
-    std::span<const vec3> bodyVerts, bodyNormals;    // posed body, world space (CPU)
-    GpuBuffers gpu;                                  // GL ids of body verts/normals SSBOs (for GPU deformers)
+    GLuint jointMatrices, jointMatricesPrev;        // SSBO mat4[J]
+    GLuint bodyPos, bodyNrm;                        // SSBO vec4[Vb], skinned body this frame
+    GLuint timerQueryPool;
 };
 
-struct DeformOut {
-    std::vector<vec3> verts;                                  // world space, sim-mesh order (CPU path)
-    unsigned int glVertexBuffer = 0;                          // set instead by GPU deformers (drawn directly)
-    std::unordered_map<std::string, std::vector<float>> scalars; // per-vertex, for heatmaps
+struct DeformOut {                         // all GPU-resident
+    GLuint pos = 0, nrm = 0;               // SSBO vec4[V], drawn directly as vertex buffers
+    std::vector<std::pair<std::string, GLuint>> scalars;   // optional per-vertex float SSBOs (heatmaps, metrics)
 };
 
 class IDeformer {
 public:
     virtual ~IDeformer() = default;
     virtual const char* Name() const = 0;
-    virtual bool Bind(const GarmentAsset& g, const BodyModel& body, const toml::table& cfg) = 0;
-    virtual void Reset() = 0;                                 // clear temporal state
-    virtual void Step(const FrameContext& ctx, DeformOut& out) = 0;
+    virtual bool Bind(const GarmentAsset& g, const BodyModel& body, const toml::table& cfg) = 0; // allocate GPU buffers
+    virtual void Reset() = 0;                                 // clear temporal state (GPU buffers)
+    virtual void Dispatch(const GpuFrame& f, DeformOut& out) = 0;  // record GPU work; no CPU readback
 };
 ```
 
@@ -413,9 +442,9 @@ public:
 | Deformer | What it does | Status |
 |---|---|---|
 | `static` | rest mesh | real |
-| `lbs` | garment skinned with the Blender-generated weights (§9) | real, **the baseline** |
-| `placeholder` | runs the whole model path, but "inference" returns **zero offsets**, so the result equals `lbs`. The HUD shows `PLACEHOLDER`. | **placeholder** |
-| `onnx` | ONNX Runtime session from a manifest. An empty or missing `model` falls back to `placeholder`. | code real, **no model shipped** |
+| `lbs` | compute skinning of the garment with the Blender-generated weights (§9), same kernel as the body | real, **the baseline** |
+| `placeholder` | runs the whole model path: an input-gather compute pass, then "inference" that writes a **zero offset SSBO**, then offset + skinning compute. The result equals `lbs`. The HUD shows `PLACEHOLDER`. | **placeholder** |
+| `onnx` | ONNX Runtime **CUDA EP**. Inputs and outputs are bound with IOBinding to **CUDA pointers mapped from the GL SSBOs** (interop, T9), so data never leaves the GPU. An empty or missing `model` falls back to `placeholder`. | code real, **no model shipped** |
 | `glsl_compute` | `shaders/user/deform_template.comp` over SSBOs (identity) | **template** |
 | `implicit_mlp` | GLSL MLP evaluated per vertex or per sample with weights in an SSBO (§8.4) | **template; weights random/zero** |
 | `cuda` | `src/deform/cuda/deform_template.cu` (identity), writes GL buffers through interop | **template** (`PG_WITH_CUDA`) |
@@ -424,18 +453,18 @@ public:
 Placeholder sketch (the stub to write in P5):
 ```cpp
 class PlaceholderDeformer final : public IDeformer {
-    LbsDeformer lbs_;            // baseline path
-    std::vector<vec3> offsets_;  // what a model would predict (unposed space)
+    LbsDeformer lbs_;            // compute-skinning baseline
+    GLuint offsets_ = 0;         // SSBO vec4[V]: what a model would predict (unposed space), zero-filled
 public:
     const char* Name() const override { return "placeholder"; }
     bool Bind(const GarmentAsset& g, const BodyModel& b, const toml::table& c) override {
-        offsets_.assign(g.simVerts.size(), vec3{0, 0, 0});
+        offsets_ = rlLoadShaderBuffer(g.simVertCount * 16, nullptr, RL_DYNAMIC_COPY);  // zeros
         return lbs_.Bind(g, b, c);
     }
-    void Reset() override { std::fill(offsets_.begin(), offsets_.end(), vec3{0, 0, 0}); }
-    void Step(const FrameContext& ctx, DeformOut& out) override {
-        // TODO(model): gather inputs from ctx per manifest, run inference, write offsets_
-        lbs_.StepWithUnposedOffsets(ctx, offsets_, out);   // offsets are all zero → equals LBS
+    void Reset() override { ClearBuffer(offsets_); }
+    void Dispatch(const GpuFrame& f, DeformOut& out) override {
+        // TODO(model): gather inputs per manifest (compute) -> inference (ORT CUDA / GLSL / CUDA) -> write offsets_
+        lbs_.DispatchWithUnposedOffsets(f, offsets_, out);   // zero offsets → identical to LBS
     }
 };
 ```
@@ -448,7 +477,7 @@ model   = ""                          # empty → placeholder behaviour
 target  = "garments/tshirt"
 rate_hz = 60
 joints  = "body22"                    # preset (no fingers/ends) or explicit list
-providers = ["CUDA", "CPU"]
+providers = ["CUDA"]                  # CPU EP only in unit tests
 
 [inputs.pose]      semantic = "joint_rotmats"     frame = "current"   # (1,J,3,3)
 [inputs.pose_prev] semantic = "joint_rotmats"     frame = "previous"
@@ -521,8 +550,9 @@ legs. Even with RSWT, LBS skirts stretch badly in a deep crouch. That is the
 expected baseline for neural models to beat, and the metrics record it.
 
 ### 9.3 Sim mesh vs render mesh
-Seams make the render mesh larger. Store a `renderToSim` map, gather it each
-tick, and recompute normals and tangents after deformation.
+Seams make the render mesh larger. A `renderToSim` index SSBO drives a
+gather compute pass each frame, followed by GPU normal/tangent recomputation
+(CSR adjacency gather, as for the body).
 
 ---
 
@@ -591,17 +621,20 @@ to `runs/<timestamp>/metrics.csv`:
 
 | Metric | Definition |
 |---|---|
-| Penetration % / mean depth | garment verts behind the nearest body vertex's normal (NCS-style); optionally against the implicit body SDF |
-| Stretch | edge length / rest: mean, max, p99, % > 1.2 (same as §9.2) |
-| Jitter | mean ‖second difference‖ of vertex positions |
-| Deformer ms | CPU timer plus GL timestamp queries (T3) |
-| Frame ms | per stage: MM / body / deform / render |
+| Penetration % / mean depth | compute pass: each garment vertex is tested against its **K = 16 candidate body vertices** (precomputed at bind) using the skinned body position and normal (NCS-style); optionally against the implicit body SDF |
+| Stretch | per-edge compute pass: length / rest, reduced to mean, max, p99 (histogram), % > 1.2 |
+| Jitter | per-vertex ‖x_t − 2x_{t−1} + x_{t−2}‖ (ring buffer of the last two frames on the GPU) |
+| Deformer ms | **GL timestamp queries** per pass (T3/T10) |
+| Frame ms | GPU per pass (skin / deform / metrics / gbuffer / lighting / post) + CPU MM time |
+
+All metrics are **computed and reduced on the GPU**. Only the reduced scalars
+come back, via fenced async readback (T11), one or two frames late.
 
 Metrics are also **split by motion state** (stand / crouch / airborne /
 transition), so jump and crouch failures show up separately.
 
 **Recording** (`runs/<timestamp>/`): `input.bin` (replayable), `poses.npy`
-(T,J,4) + `root.npy` **[D20]**, optional `garment_<id>.npy` (T,V,3),
+(T,J,4) + `root.npy` **[D20]**, optional `garment_<id>.npy` (T,V,3) (copied GPU→GPU into a staging buffer, then fenced async readback),
 `poses.bvh`, and PNG/MP4 via an ffmpeg pipe.
 
 **A/B:** Tab cycles deformers. *Split* mode draws a second Geno 1 m to the side with deformer B.
@@ -611,13 +644,14 @@ transition), so jump and crouch failures show up separately.
 
 ## 13. Performance budget (60 fps @ 1080p, RTX 3060-class)
 
-| Stage | Budget |
-|---|---|
-| Motion matching (amortized search + pose + IK) | ≤ 1 ms |
-| Morphs + LBS + normals (body) | ≤ 1 ms |
-| Garment deformers | measured; target ≤ 4 ms each |
-| Render | ≤ 6 ms |
-| UI + metrics | ≤ 2 ms |
+| Stage | Where | Budget |
+|---|---|---|
+| Motion matching (amortized search + pose + IK) | CPU | ≤ 1 ms |
+| Morphs + skinning + normals (body + garments) | GPU compute | ≤ 0.3 ms |
+| Garment deformers | GPU | measured with timestamp queries; target ≤ 4 ms each |
+| Metrics | GPU compute | ≤ 0.3 ms |
+| Render (deferred, shadows, SSAO, post) | GPU | ≤ 6 ms |
+| UI | CPU + GPU | ≤ 1 ms |
 
 ---
 
@@ -625,13 +659,14 @@ transition), so jump and crouch failures show up separately.
 
 | Area | Tests |
 |---|---|
-| gpu | `tools/gpu_validate` T0–T9 on the target machine (P0 gate) |
+| gpu | `tools/gpu_validate` T0–T11 on the target **hardware** GPU (P0 gate). GPU tests are labeled `gpu` in CTest and are skipped (not faked) on machines without one. |
 | math | quat identities, slerp endpoints, spring convergence |
 | anim | parse `Geno_bind.bvh`: 75 joints, FK hips ≈ 0.855 m; mirror twice = identity |
 | mm | 27 features; self-query returns the same frame; AABB = brute force; tag filter never returns a wrong-stance frame; jump commit does no search until `land`; inertialization offset → 0 with no pop; replay determinism |
-| body | zero morphs + bind pose → rest; identity LBS is a no-op; normals are unit |
+| body | GPU morph+skin pass vs CPU oracle (as T10, on real Geno data); zero morphs + bind pose → rest; normals are unit |
 | garment | Blender output: weights sum to 1, ≤ 4 influences, 0 penetrating verts on the bind pose; stretch regression vs the table in §9.2 |
-| deform | `placeholder` == `lbs` bit-for-bit; manifest validation; ONNX path with a **test-only identity graph generated in the test**; `implicit_mlp` GPU vs CPU parity (as in T3) |
+| deform | `placeholder` == `lbs` bit-for-bit (GPU readback in the test); manifest validation; ONNX CUDA-EP path with a **test-only identity graph generated in the test**, bound through interop; `implicit_mlp` GPU vs CPU parity (as in T3) |
+| eval | GPU metric reductions vs CPU oracle on recorded frames |
 | render | a hidden-window frame renders with no GL errors; every material shader compiles |
 
 ---
@@ -643,13 +678,13 @@ user about its open decisions.**
 
 | # | Phase | Deliverable | Gate decisions |
 |---|---|---|---|
-| P0 | Shell | **run `gpu_validate` on the Windows target (T0–T9)**; CMake/vcpkg build, raylib window, glad via `rlGetProcAddress`, ImGui, fixed tick, cameras, ground grid, TOML + hot reload | D18 |
-| P1 | Geno + clips | ufbx Geno load, CPU LBS, procedural morphs, BVH loader, FK, mirror, clip browser | D19 |
+| P0 | Shell | **run `gpu_validate` on the Windows/NVIDIA hardware (T0–T11, no `--allow-software`)**; CMake/vcpkg build, raylib window, glad via `rlGetProcAddress`, ImGui, fixed tick, cameras, ground grid, TOML + hot reload, GPU timestamp profiler | D18, D26 |
+| P1 | Geno + clips | ufbx Geno load → GPU buffers, **compute morph+skin pass**, GPU normals, procedural morphs, BVH loader, FK, mirror, clip browser | D19 |
 | P2 | Rendering | deferred PBR + IBL + shadows + SSAO + AgX + FXAA, materials incl. cloth, artifact grid, custom shader hook | D11, D14 |
 | P3 | Motion matching | tags + tag suggester + clip-browser tagging (seeded from the scan CSVs), DB build, AABB search, controller (walk/run/sprint/crouch/strafe/**jump**), inertialization, sync/adjust/clamp, foot IK, debug panel, record/replay | D6, D15b |
 | P4 | Garments | Blender tools (`export_geno_body`, `fit_garment`, `skin_garment`), procedural skirt/cape, GarmentCode T-shirt + pants, `lbs` baseline | D23 |
-| P5 | Deformers + eval | `IDeformer`, placeholder/onnx/body_corrective stubs, manifest, metrics HUD (split by state), recording, A/B, eval track, headless | D9, D10, D13, D20 |
-| P6 | GPU extras | `glsl_compute`, `implicit_mlp` + implicit inspector, `cuda` template + CUDA–GL interop, video capture | D10, D24 |
+| P5 | Deformers + eval | `IDeformer` (GPU), placeholder/body_corrective stubs, **ONNX CUDA EP via CUDA–GL interop**, manifest, GPU metrics + async readback, HUD (split by state), recording, A/B, eval track, headless | D9, D10, D13, D20 |
+| P6 | GPU extras | `glsl_compute`, `implicit_mlp` + implicit inspector, `cuda` template, video capture | D24 |
 
 ---
 

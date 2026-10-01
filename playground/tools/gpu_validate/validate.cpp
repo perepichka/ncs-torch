@@ -1,6 +1,8 @@
 // raylib 6.0 (GRAPHICS_API_OPENGL_43) capability validation for the NCS playground.
 // Checks the GPU features the spec depends on; prints PASS/FAIL per test. Exit code = #failures.
 // The MLP weights are random (seeded) and generated at runtime: this is NOT a trained model.
+// Hardware GPU required: software rasterizers (llvmpipe, WARP, SwiftShader, ...) FAIL T1 unless
+// --allow-software is passed, in which case the run only checks API usage, not the GPU.
 // NOTE: never include <windows.h> (or CUDA/GL system headers) in a TU that includes raylib.h;
 // Win32 symbols clash with raylib (CloseWindow, Rectangle, ...). CUDA lives in cuda_interop.cpp.
 #include "raylib.h"
@@ -37,6 +39,13 @@ typedef unsigned int GLenum; typedef unsigned int GLuint; typedef int GLint; typ
 #define GL_RGBA 0x1908
 #define GL_FLOAT 0x1406
 #define GL_POINTS 0x0000
+#define GL_VENDOR 0x1F00
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
+#define GL_ALREADY_SIGNALED 0x911A
+#define GL_CONDITION_SATISFIED 0x911C
+#define GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS 0x90DB
+typedef struct __GLsync* GLsync;
 static const unsigned char* (PG_GLAPI *pglGetString)(GLenum);
 static void (PG_GLAPI *pglGetIntegerv)(GLenum, GLint*);
 static void (PG_GLAPI *pglGenQueries)(int, GLuint*);
@@ -48,6 +57,9 @@ static void (PG_GLAPI *pglBindTexture)(GLenum, GLuint);
 static void (PG_GLAPI *pglGetTexImage)(GLenum, GLint, GLenum, GLenum, void*);
 static void (PG_GLAPI *pglDrawArrays)(GLenum, GLint, int);
 static GLenum (PG_GLAPI *pglGetError)(void);
+static GLsync (PG_GLAPI *pglFenceSync)(GLenum, unsigned int);
+static GLenum (PG_GLAPI *pglClientWaitSync)(GLsync, unsigned int, GLuint64);
+static void (PG_GLAPI *pglDeleteSync)(GLsync);
 template <class F> static bool load(F& f, const char* n) { f = (F)rlGetProcAddress(n); return f != nullptr; }
 
 #ifdef PG_WITH_CUDA
@@ -106,7 +118,17 @@ float mlp(vec3 p) {
 }
 )";
 
-int main() {
+static bool IsSoftwareRenderer(const char* r) {
+    std::string s = r ? r : "";
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+    for (const char* k : {"llvmpipe", "softpipe", "swrast", "lavapipe", "swiftshader", "microsoft basic render", "gdi generic", "warp"})
+        if (s.find(k) != std::string::npos) return true;
+    return false;
+}
+
+int main(int argc, char** argv) {
+    bool allowSoftware = false;
+    for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--allow-software") allowSoftware = true;
     SetConfigFlags(FLAG_WINDOW_HIDDEN);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(256, 256, "rlval");
@@ -115,19 +137,26 @@ int main() {
         load(pglGenQueries, "glGenQueries") && load(pglBeginQuery, "glBeginQuery") && load(pglEndQuery, "glEndQuery") &&
         load(pglGetQueryObjectui64v, "glGetQueryObjectui64v") && load(pglMemoryBarrier, "glMemoryBarrier") &&
         load(pglBindTexture, "glBindTexture") && load(pglGetTexImage, "glGetTexImage") &&
-        load(pglDrawArrays, "glDrawArrays") && load(pglGetError, "glGetError");
+        load(pglDrawArrays, "glDrawArrays") && load(pglGetError, "glGetError") &&
+        load(pglFenceSync, "glFenceSync") && load(pglClientWaitSync, "glClientWaitSync") && load(pglDeleteSync, "glDeleteSync");
     report("T0 raw GL entry points via rlGetProcAddress", glOk);
     if (!glOk) return 1;
 
-    GLint inv = 0, ssbo = 0, shm = 0;
+    GLint inv = 0, ssbo = 0, shm = 0, csBlocks = 0;
+    pglGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, &csBlocks);
     pglGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &inv);
     pglGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &ssbo);
     pglGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &shm);
     char info[512];
-    snprintf(info, sizeof info, "| %s | GL %s | GLSL %s | rlgl ver %d | maxInvocations %d | maxSSBO %d MB | shared %d KB",
-        pglGetString(GL_RENDERER), pglGetString(GL_VERSION), pglGetString(GL_SHADING_LANGUAGE_VERSION),
-        rlGetVersion(), inv, ssbo >> 20, shm >> 10);
-    report("T1 GL 4.3+ core context with compute", rlGetVersion() == RL_OPENGL_43, info);
+    const char* renderer = (const char*)pglGetString(GL_RENDERER);
+    bool software = IsSoftwareRenderer(renderer);
+    snprintf(info, sizeof info, "| %s / %s | GL %s | GLSL %s | maxInvocations %d | CS SSBO blocks %d | maxSSBO %d MB | shared %d KB",
+        pglGetString(GL_VENDOR), renderer, pglGetString(GL_VERSION), pglGetString(GL_SHADING_LANGUAGE_VERSION),
+        inv, csBlocks, ssbo >> 20, shm >> 10);
+    report("T1 hardware GPU, GL 4.3+ core context with compute", rlGetVersion() == RL_OPENGL_43 && (!software || allowSoftware), info);
+    if (software)
+        printf("       %s\n", allowSoftware ? "WARNING: SOFTWARE RASTERIZER (--allow-software): API-only run, NOT a GPU validation; timings meaningless"
+                                            : "software rasterizer detected: run on the target GPU (or pass --allow-software for an API-only check)");
 
     // T2: shader compile failure is non-fatal (needed for hot reload: keep last good program)
     unsigned int bad = rlLoadShader("#version 430\nvoid main(){ this is not glsl }", RL_COMPUTE_SHADER);
@@ -284,6 +313,93 @@ void main(){ ivec2 p = ivec2(gl_GlobalInvocationID.xy); imageStore(img, p, vec4(
     // T8: newer GLSL (#version 450) accepted in the requested 4.3 context when the driver offers it
     unsigned int v450 = rlLoadShader("#version 450\nlayout(local_size_x=1) in; void main(){}", RL_COMPUTE_SHADER);
     report("T8 '#version 450' shaders compile (driver-dependent; NVIDIA exposes 4.6)", v450 != 0);
+
+    // T10: GPU skinning + sparse morph targets in one compute pass (Geno-sized), parity vs CPU reference
+    {
+        const int NV = 10329, NB = 75, NM = 3;
+        struct Vtx { float p[4], n[4]; uint32_t bi[4]; float bw[4]; };
+        std::mt19937 rng(7); std::uniform_real_distribution<float> U(-1, 1);
+        std::vector<Vtx> vtx(NV);
+        for (auto& v : vtx) {
+            for (int k = 0; k < 3; k++) { v.p[k] = U(rng); v.n[k] = U(rng); }
+            v.p[3] = 1; v.n[3] = 0;
+            float sum = 0; for (int k = 0; k < 4; k++) { v.bi[k] = (uint32_t)(rng() % NB); v.bw[k] = 0.05f + std::fabs(U(rng)); sum += v.bw[k]; }
+            for (int k = 0; k < 4; k++) v.bw[k] /= sum;
+        }
+        std::vector<float> bones(NB * 16);                       // column-major mat4: rotation about a random axis + translation
+        for (int b = 0; b < NB; b++) {
+            float ax[3] = {U(rng), U(rng), U(rng)}; float l = std::sqrt(ax[0]*ax[0] + ax[1]*ax[1] + ax[2]*ax[2]); for (auto& a : ax) a /= l;
+            float an = U(rng) * 3.14159f, c = std::cos(an), sn = std::sin(an), t = 1 - c, x = ax[0], y = ax[1], z = ax[2];
+            float R[9] = {t*x*x + c, t*x*y - sn*z, t*x*z + sn*y,  t*x*y + sn*z, t*y*y + c, t*y*z - sn*x,  t*x*z - sn*y, t*y*z + sn*x, t*z*z + c};
+            float* M = &bones[b * 16];
+            for (int col = 0; col < 3; col++) for (int row = 0; row < 3; row++) M[col * 4 + row] = R[row * 3 + col];
+            M[3] = M[7] = M[11] = 0; M[12] = U(rng); M[13] = U(rng); M[14] = U(rng); M[15] = 1;
+        }
+        std::vector<uint32_t> moff(NV + 1, 0); std::vector<float> mdelta;   // vertex-major sparse morphs: (dx,dy,dz,morphIdx)
+        for (int i = 0; i < NV; i++) {
+            moff[i] = (uint32_t)(mdelta.size() / 4);
+            for (int m = 0; m < NM; m++) if (rng() % 3 == 0) { mdelta.insert(mdelta.end(), {0.1f * U(rng), 0.1f * U(rng), 0.1f * U(rng), (float)m}); }
+        }
+        moff[NV] = (uint32_t)(mdelta.size() / 4);
+        float mw[NM] = {0.7f, -0.3f, 1.0f};
+        unsigned int bV = rlLoadShaderBuffer(NV * sizeof(Vtx), vtx.data(), RL_STATIC_DRAW);
+        unsigned int bB = rlLoadShaderBuffer((unsigned)(bones.size() * 4), bones.data(), RL_DYNAMIC_DRAW);
+        unsigned int bO = rlLoadShaderBuffer((unsigned)(moff.size() * 4), moff.data(), RL_STATIC_DRAW);
+        unsigned int bD = rlLoadShaderBuffer((unsigned)(mdelta.size() * 4), mdelta.data(), RL_STATIC_DRAW);
+        unsigned int bW = rlLoadShaderBuffer(sizeof mw, mw, RL_DYNAMIC_DRAW);
+        unsigned int bOut = rlLoadShaderBuffer(NV * 32, nullptr, RL_DYNAMIC_COPY);      // vec4 pos + vec4 normal, drawable as VBO
+        unsigned int scs = rlLoadShader(R"(#version 430
+layout(local_size_x = 64) in;
+struct Vtx { vec4 p; vec4 n; uvec4 bi; vec4 bw; };
+struct Out { vec4 p; vec4 n; };
+layout(std430, binding = 0) readonly buffer Verts { Vtx v[]; };
+layout(std430, binding = 1) readonly buffer Bones { mat4 skin[]; };
+layout(std430, binding = 2) readonly buffer MorphOff { uint moff[]; };
+layout(std430, binding = 3) readonly buffer MorphDelta { vec4 md[]; };
+layout(std430, binding = 4) readonly buffer MorphW { float mw[]; };
+layout(std430, binding = 5) writeonly buffer Result { Out o[]; };
+uniform int n;
+void main() {
+    uint i = gl_GlobalInvocationID.x; if (i >= uint(n)) return;
+    vec3 p = v[i].p.xyz;
+    for (uint k = moff[i]; k < moff[i + 1u]; k++) p += mw[uint(md[k].w)] * md[k].xyz;
+    mat4 M = v[i].bw.x * skin[v[i].bi.x] + v[i].bw.y * skin[v[i].bi.y] + v[i].bw.z * skin[v[i].bi.z] + v[i].bw.w * skin[v[i].bi.w];
+    o[i].p = vec4((M * vec4(p, 1.0)).xyz, 1.0);
+    o[i].n = vec4(mat3(M) * v[i].n.xyz, 0.0);
+})", RL_COMPUTE_SHADER);
+        unsigned int sprog = scs ? rlLoadShaderProgramCompute(scs) : 0;
+        bool ok = sprog != 0; char b10[200] = "| compute skinning shader failed to compile";
+        if (ok) {
+            GLuint q; pglGenQueries(1, &q);
+            rlEnableShader(sprog); rlSetUniform(rlGetLocationUniform(sprog, "n"), &NV, RL_SHADER_UNIFORM_INT, 1);
+            rlBindShaderBuffer(bV, 0); rlBindShaderBuffer(bB, 1); rlBindShaderBuffer(bO, 2); rlBindShaderBuffer(bD, 3); rlBindShaderBuffer(bW, 4); rlBindShaderBuffer(bOut, 5);
+            pglBeginQuery(GL_TIME_ELAPSED, q); rlComputeShaderDispatch((NV + 63) / 64, 1, 1); pglEndQuery(GL_TIME_ELAPSED);
+            rlDisableShader(); pglMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+            GLuint64 ns = 0; pglGetQueryObjectui64v(q, GL_QUERY_RESULT, &ns);
+            std::vector<float> out(NV * 8); rlReadShaderBuffer(bOut, out.data(), NV * 32, 0);
+            double err = 0;
+            for (int i = 0; i < NV; i++) {
+                float p[3] = {vtx[i].p[0], vtx[i].p[1], vtx[i].p[2]};
+                for (uint32_t k = moff[i]; k < moff[i + 1]; k++) for (int c = 0; c < 3; c++) p[c] += mw[(int)mdelta[k * 4 + 3]] * mdelta[k * 4 + c];
+                float M[16] = {0};
+                for (int j = 0; j < 4; j++) for (int e = 0; e < 16; e++) M[e] += vtx[i].bw[j] * bones[vtx[i].bi[j] * 16 + e];
+                for (int r = 0; r < 3; r++) {
+                    float ref = M[r] * p[0] + M[4 + r] * p[1] + M[8 + r] * p[2] + M[12 + r];
+                    float refn = M[r] * vtx[i].n[0] + M[4 + r] * vtx[i].n[1] + M[8 + r] * vtx[i].n[2];
+                    err = std::fmax(err, std::fmax(std::fabs(ref - out[i * 8 + r]), std::fabs(refn - out[i * 8 + 4 + r])));
+                }
+            }
+            ok = err < 1e-4;
+            snprintf(b10, sizeof b10, "| %d verts, %d bones, %d sparse morph deltas | max|err| %.1e | GPU %.3f ms", NV, NB, (int)(mdelta.size() / 4), err, ns / 1e6);
+        }
+        report("T10 GPU skinning + sparse morph targets (compute, Geno-sized) matches CPU reference", ok, b10);
+
+        // T11: async GPU->CPU readback with a fence (metrics/recording path; never stall the frame)
+        GLsync fence = pglFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        GLenum st = pglClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        pglDeleteSync(fence);
+        report("T11 fence sync for deferred readback", st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED);
+    }
 
     // T9: CUDA writes into the GL buffer that T5 draws as vertices (zero-copy CUDA deformer / ORT CUDA EP path)
 #ifdef PG_WITH_CUDA

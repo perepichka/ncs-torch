@@ -11,7 +11,7 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 |---|---|---|---|---|
 | D6 | Final motion DB clip list? | lafan1-resolved walk/run/sprint + scan-selected crouch/transition/jump ranges + 100STYLE `Neutral`/`Crouched`, all mirrored; `ground*` excluded (mostly crawl) | Fewer clips for faster iteration; more 100STYLE styles | P3 |
 | D9 | Model output convention: does `ncs` predict unposed verts (engine applies LBS) or world space? | `unposed` + garment LBS, as in the original NCS | `world`, offsets | P5 |
-| D10 | ORT execution providers? | CUDA EP + CPU EP | Also TensorRT or DirectML | P5 |
+| D10 | ORT execution providers? | CUDA EP only on the frame path (zero-copy via CUDA–GL interop); CPU EP only in unit tests | Add TensorRT EP. DirectML is not an option with GL: it would need D3D12 interop. | P5 |
 | D11 | Asset handling? | `tools/fetch_assets.ps1` into git-ignored `data/`; generated garments not committed | Commit small CC0 assets; Git LFS | P2 |
 | D13 | Which metrics matter most? | Penetration, stretch, jitter, timings, split by motion state | Port `ncs.physics` energies to C++; ground-truth sim comparison | P5 |
 | D14 | Is the rendering bar enough (deferred PBR, IBL, shadows, SSAO, sheen cloth, AgX, FXAA)? | Yes for v1 | TAA, skin SSS, contact shadows | P2 |
@@ -20,6 +20,7 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 | D19 | Geno has no blendshapes. Are procedural test morphs + placeholder correctives enough? | Yes | Sculpt real morphs; a second character with blendshapes | P1 |
 | D20 | Recording format for the Python `ncs` side? | `.npy` quaternions + root trajectory, plus BVH | `.npz` with rotation matrices | P5 |
 | D23 | Blender runtime for tools: the `bpy` pip wheel in a Python 3.11 venv (what the prototype used), or a Blender app install with scipy pip-installed into its Python? Which Blender version? | `bpy` wheel venv (tested with 5.0.1) | Blender 4.2 LTS app + `--python` | P4 |
+| D26 | Graphics API. Real engines on Windows use **D3D12 or Vulkan**. OpenGL 4.6 (raylib) covers everything this spec uses: compute, SSBOs, deferred, GPU skinning, CUDA interop. It lacks hardware ray tracing, mesh shaders (except via NV extensions), async compute queues, explicit memory and bindless-by-default. Stay on raylib/GL or move to a modern API? | Stay on raylib/GL 4.6: fastest to build, ports Holden/GenoView code, and the GPU-side techniques map 1:1. Revisit if RT shadows/GI or async compute become needed. | D3D12 (+ DirectML option for ORT, D3D12–CUDA interop), or Vulkan, with a thin custom renderer (e.g. on bgfx/Diligent, or raw). Several times more engine code. | P0 |
 | D24 | Which implicit neural models will you test first? This shapes the `implicit_mlp` manifest. | Neural body SDF (collision proxy + metric) and a per-vertex deformation field | NeRF-like/appearance; hash-grid encodings (CUDA path) | P6 |
 
 ## Resolved
@@ -27,7 +28,8 @@ answer comes in, move the item to *Resolved* along with the answer and the date.
 | ID | Decision | Date |
 |---|---|---|
 | D1a | Engine language is **C++**, not Python. | 2026-10-01 |
-| D1 | **raylib**, provided modern shader support is validated. raylib 6.0 GL 4.3 passed T0–T8 (compute, SSBO, MRT float, image store, GPU implicit MLP + sphere tracing). T9 (CUDA–GL interop) must pass on the Windows target in P0. | 2026-10-01 |
+| D1 | **raylib**, provided modern shader support is validated. raylib 6.0 GL 4.3 passed T0–T8, T10 and T11 **API-only** (sandbox software rasterizer). **Hardware validation of T0–T11 on the Windows/NVIDIA target is the P0 gate.** The API choice is reopened as D26. | 2026-10-01 |
+| D25 | **No software rendering, proper GPU rendering like real engines.** Hardware GPU only. The GPU owns all geometry: morphs, skinning, deformers, normals and metrics are compute passes. The CPU runs animation only. Readback is asynchronous and only for metrics/recording. CPU LBS exists only as a test oracle. | 2026-10-01 |
 | D2 | **Windows only.** | 2026-10-01 |
 | D3 | **Same repo** (`playground/`). | 2026-10-01 |
 | D4 | Body model: **Geno** from orangeduck's retargeted datasets. | 2026-10-01 |
