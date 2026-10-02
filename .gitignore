@@ -14,9 +14,3 @@ body_models/
 *.obj
 *.npy
 *.npz
-
-# Playground build outputs and fetched/generated data
-playground/build/
-playground/data/
-playground/runs/
-!docs/playground/data/
